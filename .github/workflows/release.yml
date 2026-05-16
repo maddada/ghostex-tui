@@ -145,6 +145,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          NEXT_RELEASE_LABEL: included-in-next-release
         run: |
           set -euo pipefail
 
@@ -183,14 +184,22 @@ jobs:
               continue
             fi
 
-            if [ "$(jq -r '.state' <<<"$data")" != "open" ]; then
-              echo "Skipping #$issue because it is not open."
-              continue
+            HAS_NEXT_RELEASE_LABEL="$(jq -r --arg label "$NEXT_RELEASE_LABEL" 'any(.labels[].name; . == $label)' <<<"$data")"
+
+            if [ "$(jq -r '.state' <<<"$data")" = "open" ]; then
+              if ! gh issue close "$issue" --repo "$GITHUB_REPOSITORY" --reason completed --comment "Released in [v${VERSION}](${RELEASE_URL})."; then
+                echo "::warning::Could not close issue #$issue."
+                continue
+              fi
+            else
+              echo "Skipping close for #$issue because it is not open."
             fi
 
-            if ! gh issue close "$issue" --repo "$GITHUB_REPOSITORY" --reason completed --comment "Released in [v${VERSION}](${RELEASE_URL})."; then
-              echo "::warning::Could not close issue #$issue."
-              continue
+            if [ "$HAS_NEXT_RELEASE_LABEL" = "true" ]; then
+              if ! gh issue edit "$issue" --repo "$GITHUB_REPOSITORY" --remove-label "$NEXT_RELEASE_LABEL"; then
+                echo "::warning::Could not remove $NEXT_RELEASE_LABEL from issue #$issue."
+                continue
+              fi
             fi
           done
 

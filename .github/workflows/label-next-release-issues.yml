@@ -1,0 +1,83 @@
+name: Label next-release issues
+
+on:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+  issues: write
+
+env:
+  NEXT_RELEASE_LABEL: included-in-next-release
+
+jobs:
+  label:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Label issues referenced by pushed commits
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          BEFORE="${{ github.event.before }}"
+          AFTER="${{ github.sha }}"
+          ZERO_SHA="0000000000000000000000000000000000000000"
+
+          if [ "$BEFORE" = "$ZERO_SHA" ]; then
+            RANGE_ARGS=(-1 "$AFTER")
+            echo "Scanning latest commit $AFTER for refs #<issue> lines."
+          else
+            RANGE_ARGS=("$BEFORE..$AFTER")
+            echo "Scanning pushed commits in $BEFORE..$AFTER for refs #<issue> lines."
+          fi
+
+          mapfile -t ISSUES < <(
+            git log --format=%b "${RANGE_ARGS[@]}" \
+              | perl -ne 'print "$1\n" if /^\s*refs\s+#([0-9]+)\s*$/i' \
+              | sort -nu
+          )
+
+          if [ "${#ISSUES[@]}" -eq 0 ]; then
+            echo "No issue refs found."
+            exit 0
+          fi
+
+          if ! gh api "repos/${GITHUB_REPOSITORY}/labels/${NEXT_RELEASE_LABEL}" >/dev/null 2>&1; then
+            gh api -X POST "repos/${GITHUB_REPOSITORY}/labels" \
+              -f name="$NEXT_RELEASE_LABEL" \
+              -f color="5319E7" \
+              -f description="Landed on master and planned for the next release." \
+              >/dev/null \
+              || gh api "repos/${GITHUB_REPOSITORY}/labels/${NEXT_RELEASE_LABEL}" >/dev/null
+          fi
+
+          for issue in "${ISSUES[@]}"; do
+            echo "Checking #$issue"
+            if ! data="$(gh api "repos/${GITHUB_REPOSITORY}/issues/${issue}")"; then
+              echo "::warning::Could not read issue #$issue; skipping."
+              continue
+            fi
+
+            if jq -e 'has("pull_request")' <<<"$data" >/dev/null; then
+              echo "Skipping #$issue because it is a pull request."
+              continue
+            fi
+
+            if [ "$(jq -r '.state' <<<"$data")" != "open" ]; then
+              echo "Skipping #$issue because it is not open."
+              continue
+            fi
+
+            if ! gh issue edit "$issue" --repo "$GITHUB_REPOSITORY" --add-label "$NEXT_RELEASE_LABEL"; then
+              echo "::warning::Could not label issue #$issue."
+              continue
+            fi
+          done
