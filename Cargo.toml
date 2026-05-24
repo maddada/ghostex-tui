@@ -29,3 +29,8 @@ toml = "0.8"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 unicode-width = "0.2"
+vt100 = "0.15"
+
+[[bin]]
+name = "ghostex-tui"
+path = "src/bin/ghostex_tui.rs"
