@@ -24,6 +24,8 @@ use serde::Deserialize;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(16);
 const SESSION_LIST_REFRESH: Duration = Duration::from_secs(5);
+const TERMINAL_SCROLLBACK_LINES: usize = 10_000;
+const MOUSE_SCROLL_LINES: usize = 3;
 const GHOSTEX_TUI_TERM: &str = "xterm-256color";
 const GHOSTEX_TUI_COLORTERM: &str = "truecolor";
 const WORKING_COLOR: Color = Color::Rgb(248, 173, 7);
@@ -43,6 +45,8 @@ struct SessionItem {
     agent: Option<String>,
     #[serde(default, rename = "projectId")]
     project_id: Option<String>,
+    #[serde(default, rename = "groupId")]
+    group_id: Option<String>,
     #[serde(default, rename = "projectName")]
     project_name: Option<String>,
     #[serde(default, rename = "projectPath")]
@@ -61,8 +65,24 @@ struct SessionListResult {
     sessions: Vec<SessionItem>,
 }
 
+#[derive(Debug, Deserialize)]
+struct CreateSessionResult {
+    #[serde(default)]
+    session: Option<CreatedSession>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreatedSession {
+    #[serde(default, rename = "ghostexId")]
+    ghostex_id: Option<String>,
+    #[serde(default, rename = "sessionId")]
+    session_id: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 struct ProjectGroup {
+    project_id: Option<String>,
+    group_id: Option<String>,
     name: String,
     sessions: Vec<SessionItem>,
 }
@@ -70,6 +90,10 @@ struct ProjectGroup {
 #[derive(Debug, Clone)]
 enum SwitchRow {
     Project(String),
+    NewTerminal {
+        project_id: Option<String>,
+        group_id: Option<String>,
+    },
     Session(SessionItem),
 }
 
@@ -77,6 +101,15 @@ enum SwitchRow {
 enum Mode {
     Attached,
     Switcher,
+}
+
+#[derive(Debug, Clone)]
+enum SwitchAction {
+    Attach(SessionItem),
+    NewTerminal {
+        project_id: Option<String>,
+        group_id: Option<String>,
+    },
 }
 
 struct PtySession {
@@ -135,7 +168,18 @@ impl PtySession {
                 }
             }
         });
-        let parser = vt100::Parser::new(area.height.max(1), area.width.max(1), 0);
+        /*
+        CDXC:GhostexTui 2026-05-25-17:18:
+        Attached Ghostex panes must scroll like Herdr panes after `zmx attach`.
+        Keep scrollback inside the TUI-owned terminal parser because the outer
+        alternate screen cannot provide normal terminal scrollback for rendered
+        pane contents.
+        */
+        let parser = vt100::Parser::new(
+            area.height.max(1),
+            area.width.max(1),
+            TERMINAL_SCROLLBACK_LINES,
+        );
         Ok(Self {
             master: pair.master,
             child,
@@ -161,7 +205,52 @@ impl PtySession {
         }
     }
 
+    fn scroll_up(&mut self, lines: usize) {
+        let next = self.parser.screen().scrollback().saturating_add(lines);
+        self.parser.set_scrollback(next);
+    }
+
+    fn scroll_down(&mut self, lines: usize) {
+        let next = self.parser.screen().scrollback().saturating_sub(lines);
+        self.parser.set_scrollback(next);
+    }
+
+    fn scroll_reset(&mut self) {
+        self.parser.set_scrollback(0);
+    }
+
+    fn handle_wheel(&mut self, mouse: MouseEvent, terminal_rect: Rect) {
+        let column = mouse.column.saturating_sub(terminal_rect.x);
+        let row = mouse.row.saturating_sub(terminal_rect.y);
+        if self.parser.screen().mouse_protocol_mode() != vt100::MouseProtocolMode::None {
+            if let Some(bytes) = encode_mouse_scroll(
+                mouse.kind,
+                column,
+                row,
+                mouse.modifiers,
+                self.parser.screen().mouse_protocol_encoding(),
+            ) {
+                self.write_input(&bytes);
+            }
+            return;
+        }
+        if self.parser.screen().alternate_screen() {
+            if let Some(bytes) =
+                encode_alternate_scroll(mouse.kind, self.parser.screen().application_cursor())
+            {
+                self.write_input(&bytes);
+            }
+            return;
+        }
+        match mouse.kind {
+            MouseEventKind::ScrollUp => self.scroll_up(MOUSE_SCROLL_LINES),
+            MouseEventKind::ScrollDown => self.scroll_down(MOUSE_SCROLL_LINES),
+            _ => {}
+        }
+    }
+
     fn write_input(&mut self, bytes: &[u8]) {
+        self.scroll_reset();
         let _ = self.writer.write_all(bytes);
         let _ = self.writer.flush();
     }
@@ -238,7 +327,7 @@ impl App {
                 self.known_attention_session_ids = next_attention_session_ids;
                 self.has_loaded_session_statuses = true;
                 let selected_session_id = self
-                    .session_at(self.selected_session_index)
+                    .selected_session_at_row()
                     .map(|session| session.session_id.clone());
                 let active_session_id = self
                     .active_session
@@ -247,19 +336,15 @@ impl App {
                 self.groups = group_sessions(sessions);
                 self.rows = switch_rows(&self.groups);
                 if let Some(selected_session_id) = selected_session_id {
-                    self.selected_session_index = self
-                        .session_index_for_session_id(&selected_session_id)
-                        .unwrap_or_else(|| {
-                            self.selected_session_index
-                                .min(self.session_count().saturating_sub(1))
-                        });
+                    if let Some(row_index) = self.row_index_for_session_id(&selected_session_id) {
+                        self.selected_row_index = row_index;
+                    } else {
+                        self.clamp_selected_row_to_selectable();
+                    }
                 } else {
-                    self.selected_session_index = self
-                        .selected_session_index
-                        .min(self.session_count().saturating_sub(1));
+                    self.clamp_selected_row_to_selectable();
                 }
-                self.selected_row_index =
-                    self.row_index_for_session_index(self.selected_session_index);
+                self.sync_selected_session_index_from_row();
                 if let Some(active_session_id) = active_session_id {
                     if let Some(session) = self.session_by_id(&active_session_id).cloned() {
                         self.active_session = Some(session);
@@ -297,23 +382,6 @@ impl App {
         }
     }
 
-    fn session_at(&self, session_index: usize) -> Option<&SessionItem> {
-        self.rows
-            .iter()
-            .filter_map(|row| match row {
-                SwitchRow::Session(session) => Some(session),
-                SwitchRow::Project(_) => None,
-            })
-            .nth(session_index)
-    }
-
-    fn session_count(&self) -> usize {
-        self.rows
-            .iter()
-            .filter(|row| matches!(row, SwitchRow::Session(_)))
-            .count()
-    }
-
     fn session_by_id(&self, session_id: &str) -> Option<&SessionItem> {
         self.rows.iter().find_map(|row| match row {
             SwitchRow::Session(session) if session.session_id == session_id => Some(session),
@@ -321,17 +389,10 @@ impl App {
         })
     }
 
-    fn session_index_for_session_id(&self, session_id: &str) -> Option<usize> {
-        let mut seen = 0usize;
-        for row in &self.rows {
-            if let SwitchRow::Session(session) = row {
-                if session.session_id == session_id {
-                    return Some(seen);
-                }
-                seen += 1;
-            }
-        }
-        None
+    fn row_index_for_session_id(&self, session_id: &str) -> Option<usize> {
+        self.rows.iter().position(
+            |row| matches!(row, SwitchRow::Session(session) if session.session_id == session_id),
+        )
     }
 
     fn activity_count(&self, activity: SessionActivity) -> usize {
@@ -339,32 +400,82 @@ impl App {
             .iter()
             .filter(|row| match row {
                 SwitchRow::Session(session) => session_activity(session) == Some(activity),
-                SwitchRow::Project(_) => false,
+                SwitchRow::Project(_) | SwitchRow::NewTerminal { .. } => false,
             })
             .count()
     }
 
-    fn row_index_for_session_index(&self, session_index: usize) -> usize {
-        let mut seen = 0usize;
-        for (idx, row) in self.rows.iter().enumerate() {
-            if matches!(row, SwitchRow::Session(_)) {
-                if seen == session_index {
-                    return idx;
-                }
-                seen += 1;
-            }
+    fn selected_session_at_row(&self) -> Option<&SessionItem> {
+        match self.rows.get(self.selected_row_index) {
+            Some(SwitchRow::Session(session)) => Some(session),
+            _ => None,
         }
-        0
+    }
+
+    fn selected_action(&self) -> Option<SwitchAction> {
+        match self.rows.get(self.selected_row_index)?.clone() {
+            SwitchRow::Session(session) => Some(SwitchAction::Attach(session)),
+            SwitchRow::NewTerminal {
+                project_id,
+                group_id,
+            } => Some(SwitchAction::NewTerminal {
+                project_id,
+                group_id,
+            }),
+            SwitchRow::Project(_) => None,
+        }
+    }
+
+    fn selectable_row_indices(&self) -> Vec<usize> {
+        self.rows
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, row)| match row {
+                SwitchRow::Project(_) => None,
+                SwitchRow::NewTerminal { .. } | SwitchRow::Session(_) => Some(idx),
+            })
+            .collect()
+    }
+
+    fn sync_selected_session_index_from_row(&mut self) {
+        self.selected_session_index = self
+            .rows
+            .iter()
+            .take(self.selected_row_index)
+            .filter(|row| matches!(row, SwitchRow::Session(_)))
+            .count();
+    }
+
+    fn clamp_selected_row_to_selectable(&mut self) {
+        let selectable_rows = self.selectable_row_indices();
+        if selectable_rows.is_empty() {
+            self.selected_row_index = 0;
+            self.selected_session_index = 0;
+            return;
+        }
+        if selectable_rows.contains(&self.selected_row_index) {
+            return;
+        }
+        self.selected_row_index = selectable_rows
+            .iter()
+            .copied()
+            .find(|row| *row >= self.selected_row_index)
+            .unwrap_or_else(|| *selectable_rows.last().unwrap_or(&0));
+        self.sync_selected_session_index_from_row();
     }
 
     fn select_delta(&mut self, delta: isize) {
-        let count = self.session_count();
-        if count == 0 {
+        let selectable_rows = self.selectable_row_indices();
+        if selectable_rows.is_empty() {
             return;
         }
-        let next = wrap_index(self.selected_session_index as isize + delta, count);
-        self.selected_session_index = next;
-        self.selected_row_index = self.row_index_for_session_index(next);
+        let current = selectable_rows
+            .iter()
+            .position(|row| *row == self.selected_row_index)
+            .unwrap_or(0);
+        let next = wrap_index(current as isize + delta, selectable_rows.len());
+        self.selected_row_index = selectable_rows[next];
+        self.sync_selected_session_index_from_row();
     }
 
     fn select_project_delta(&mut self, delta: isize) {
@@ -375,7 +486,7 @@ impl App {
         and keyboard users can cycle through project sections without landing
         on non-selectable headers.
         */
-        let starts = self.project_session_starts();
+        let starts = self.project_first_session_rows();
         if starts.is_empty() {
             return;
         }
@@ -384,7 +495,7 @@ impl App {
             .enumerate()
             .rev()
             .find_map(|(idx, start)| {
-                if *start <= self.selected_session_index {
+                if *start <= self.selected_row_index {
                     Some(idx)
                 } else {
                     None
@@ -392,37 +503,38 @@ impl App {
             })
             .unwrap_or(0);
         let next_project = wrap_index(current_project as isize + delta, starts.len());
-        self.selected_session_index = starts[next_project];
-        self.selected_row_index = self.row_index_for_session_index(self.selected_session_index);
+        self.selected_row_index = starts[next_project];
+        self.sync_selected_session_index_from_row();
     }
 
-    fn project_session_starts(&self) -> Vec<usize> {
+    fn project_first_session_rows(&self) -> Vec<usize> {
         let mut starts = Vec::new();
-        let mut next_session_index = 0usize;
-        for group in &self.groups {
-            if group.sessions.is_empty() {
-                continue;
+        let mut in_project = false;
+        let mut has_session_for_project = false;
+        for (idx, row) in self.rows.iter().enumerate() {
+            match row {
+                SwitchRow::Project(_) => {
+                    in_project = true;
+                    has_session_for_project = false;
+                }
+                SwitchRow::Session(_) if in_project && !has_session_for_project => {
+                    starts.push(idx);
+                    has_session_for_project = true;
+                }
+                SwitchRow::NewTerminal { .. } | SwitchRow::Session(_) => {}
             }
-            starts.push(next_session_index);
-            next_session_index += group.sessions.len();
         }
         starts
     }
 
-    fn select_row_at_document_y(&mut self, doc_y: usize) -> Option<SessionItem> {
+    fn select_row_at_document_y(&mut self, doc_y: usize) -> Option<SwitchAction> {
         let row = self.rows.get(doc_y)?.clone();
-        let SwitchRow::Session(session) = row else {
+        if matches!(row, SwitchRow::Project(_)) {
             return None;
-        };
+        }
         self.selected_row_index = doc_y;
-        self.selected_session_index = self
-            .rows
-            .iter()
-            .take(doc_y + 1)
-            .filter(|row| matches!(row, SwitchRow::Session(_)))
-            .count()
-            .saturating_sub(1);
-        Some(session)
+        self.sync_selected_session_index_from_row();
+        self.selected_action()
     }
 
     fn switcher_max_scroll(&self, viewport: Rect) -> usize {
@@ -495,7 +607,7 @@ fn main() -> io::Result<()> {
 
 fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
-    let chunks = Layout::vertical([Constraint::Length(2), Constraint::Min(1)]).split(area);
+    let chunks = Layout::vertical([Constraint::Length(3), Constraint::Min(1)]).split(area);
     render_header(frame, app, chunks[0]);
     match app.mode {
         Mode::Attached => render_terminal(frame, app, chunks[1]),
@@ -504,6 +616,26 @@ fn render(frame: &mut Frame, app: &mut App) {
 }
 
 fn render_header(frame: &mut Frame, app: &App, area: Rect) {
+    /*
+    CDXC:GhostexTui 2026-05-25-17:24:
+    The attached TUI needs visible chrome separation from the terminal pane.
+    Render the top bar on a full-width background with a bottom rule so phone
+    and desktop users can distinguish Ghostex controls from session output.
+    */
+    let header_style = Style::default().bg(Color::Rgb(24, 24, 37));
+    frame.render_widget(Clear, area);
+    frame.render_widget(Paragraph::new("").style(header_style), area);
+    if area.height > 0 {
+        let border_y = area.y + area.height.saturating_sub(1);
+        frame.render_widget(
+            Paragraph::new("─".repeat(area.width as usize)).style(
+                Style::default()
+                    .fg(Color::Rgb(69, 71, 90))
+                    .bg(Color::Rgb(24, 24, 37)),
+            ),
+            Rect::new(area.x, border_y, area.width, 1),
+        );
+    }
     let switch_width = 12u16.min(area.width);
     let status_width = area.width.saturating_sub(switch_width);
     let status = Rect::new(area.x, area.y, status_width, area.height);
@@ -529,21 +661,27 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
         Span::raw(" "),
         Span::styled(
             title.to_string(),
-            Style::default().add_modifier(Modifier::BOLD),
+            header_style.fg(Color::White).add_modifier(Modifier::BOLD),
         ),
     ];
     if app.mode == Mode::Attached {
+        /*
+        CDXC:GhostexTui 2026-05-25-17:23:
+        Attached-view activity totals should be compact dot counters without
+        the literal words "working" or "attention"; the dot colors carry the
+        same meaning as the macOS sidebar indicators.
+        */
         title_spans.extend(activity_count_spans(
             app.activity_count(SessionActivity::Working),
             app.activity_count(SessionActivity::Attention),
         ));
     }
     frame.render_widget(
-        Paragraph::new(Line::from(title_spans)),
+        Paragraph::new(Line::from(title_spans)).style(header_style),
         Rect::new(status.x, status.y, status.width, 1),
     );
     frame.render_widget(
-        Paragraph::new(format!(" {project}")).style(Style::default().fg(Color::DarkGray)),
+        Paragraph::new(format!(" {project}")).style(header_style.fg(Color::DarkGray)),
         Rect::new(status.x, status.y + 1, status.width, 1),
     );
     frame.render_widget(
@@ -558,6 +696,17 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
             .block(Block::default().borders(Borders::LEFT)),
         switch,
     );
+    if area.height > 0 {
+        let border_y = area.y + area.height.saturating_sub(1);
+        frame.render_widget(
+            Paragraph::new("─".repeat(area.width as usize)).style(
+                Style::default()
+                    .fg(Color::Rgb(69, 71, 90))
+                    .bg(Color::Rgb(24, 24, 37)),
+            ),
+            Rect::new(area.x, border_y, area.width, 1),
+        );
+    }
 }
 
 fn render_terminal(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -664,13 +813,13 @@ fn activity_count_spans(working_count: usize, attention_count: usize) -> Vec<Spa
         Span::raw("   "),
         Span::styled("●", Style::default().fg(WORKING_COLOR)),
         Span::styled(
-            format!(" {working_count} working"),
+            format!(" {working_count}"),
             Style::default().fg(Color::White),
         ),
         Span::raw("  "),
         Span::styled("●", Style::default().fg(ATTENTION_COLOR)),
         Span::styled(
-            format!(" {attention_count} attention"),
+            format!(" {attention_count}"),
             Style::default().fg(Color::White),
         ),
     ]
@@ -727,6 +876,39 @@ fn render_switcher(frame: &mut Frame, app: &mut App, area: Rect) {
                     .fg(Color::Rgb(137, 180, 250))
                     .add_modifier(Modifier::BOLD),
             ))),
+            SwitchRow::NewTerminal { .. } => {
+                let selected = idx == app.selected_row_index;
+                let bg = if selected {
+                    Color::Rgb(49, 50, 68)
+                } else {
+                    Color::Reset
+                };
+                /*
+                CDXC:GhostexTui 2026-05-25-17:20:
+                Each switcher project should expose a `+ new terminal` action
+                before its sessions. It creates a terminal in that project/group
+                through the existing Ghostex CLI create-session bridge so the
+                macOS app remains the owner of project placement and zmx setup.
+                */
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        "  + ",
+                        Style::default().fg(Color::Rgb(115, 231, 156)).bg(bg),
+                    ),
+                    Span::styled(
+                        "new terminal",
+                        Style::default()
+                            .fg(Color::White)
+                            .bg(bg)
+                            .add_modifier(if selected {
+                                Modifier::BOLD
+                            } else {
+                                Modifier::empty()
+                            }),
+                    ),
+                ]))
+                .style(Style::default().bg(bg))
+            }
             SwitchRow::Session(session) => {
                 let selected = idx == app.selected_row_index;
                 let bg = if selected {
@@ -785,11 +967,7 @@ fn handle_key(app: &mut App, key: KeyEvent, terminal_rect: Rect) -> bool {
             KeyCode::Right => app.select_project_delta(1),
             KeyCode::PageUp => app.select_delta(-5),
             KeyCode::PageDown => app.select_delta(5),
-            KeyCode::Enter | KeyCode::Char(' ') => {
-                if let Some(session) = app.session_at(app.selected_session_index).cloned() {
-                    app.attach(session, terminal_rect);
-                }
-            }
+            KeyCode::Enter | KeyCode::Char(' ') => handle_switch_action(app, terminal_rect),
             _ => {}
         },
         Mode::Attached => {
@@ -823,10 +1001,19 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, full: Rect, terminal_rect: Rec
                 app.mode = Mode::Switcher;
                 app.refresh_sessions(false);
             }
+            if matches!(
+                mouse.kind,
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+            ) && rect_contains(terminal_rect, mouse.column, mouse.row)
+            {
+                if let Some(pty) = app.pty.as_mut() {
+                    pty.handle_wheel(mouse, terminal_rect);
+                }
+            }
         }
         Mode::Switcher => match mouse.kind {
-            MouseEventKind::ScrollUp => app.select_delta(-1),
-            MouseEventKind::ScrollDown => app.select_delta(1),
+            MouseEventKind::ScrollUp => app.select_delta(-(MOUSE_SCROLL_LINES as isize)),
+            MouseEventKind::ScrollDown => app.select_delta(MOUSE_SCROLL_LINES as isize),
             MouseEventKind::Down(MouseButton::Left) => {
                 if mouse.row < terminal_rect.y {
                     return;
@@ -834,12 +1021,40 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, full: Rect, terminal_rect: Rec
                 let doc_y = app
                     .switch_scroll
                     .saturating_add(mouse.row.saturating_sub(terminal_rect.y) as usize);
-                if let Some(session) = app.select_row_at_document_y(doc_y) {
-                    app.attach(session, terminal_rect);
+                if app.select_row_at_document_y(doc_y).is_some() {
+                    handle_switch_action(app, terminal_rect);
                 }
             }
             _ => {}
         },
+    }
+}
+
+fn handle_switch_action(app: &mut App, terminal_rect: Rect) {
+    match app.selected_action() {
+        Some(SwitchAction::Attach(session)) => app.attach(session, terminal_rect),
+        Some(SwitchAction::NewTerminal {
+            project_id,
+            group_id,
+        }) => match create_terminal(project_id.as_deref(), group_id.as_deref()) {
+            Ok(created) => {
+                app.status.clear();
+                app.refresh_sessions(false);
+                if let Some(session_id) = created
+                    .session
+                    .and_then(|session| session.ghostex_id.or(session.session_id))
+                {
+                    if let Some(row_index) = app.row_index_for_session_id(&session_id) {
+                        app.selected_row_index = row_index;
+                        app.sync_selected_session_index_from_row();
+                    }
+                }
+            }
+            Err(err) => {
+                app.status = format!("Could not create terminal: {err}");
+            }
+        },
+        None => {}
     }
 }
 
@@ -857,6 +1072,30 @@ fn fetch_sessions() -> io::Result<Vec<SessionItem>> {
     let result: SessionListResult = serde_json::from_slice(&output.stdout)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
     Ok(result.sessions)
+}
+
+fn create_terminal(
+    project_id: Option<&str>,
+    group_id: Option<&str>,
+) -> io::Result<CreateSessionResult> {
+    let mut command = format!("{} create-session", ghostex_cli_command());
+    if let Some(project_id) = project_id.filter(|value| !value.trim().is_empty()) {
+        command.push_str(" --project-id ");
+        command.push_str(&shell_quote(project_id));
+    }
+    if let Some(group_id) = group_id.filter(|value| !value.trim().is_empty()) {
+        command.push_str(" --group-id ");
+        command.push_str(&shell_quote(group_id));
+    }
+    let output = Command::new("/bin/zsh").arg("-lc").arg(command).output()?;
+    if !output.status.success() {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        ));
+    }
+    serde_json::from_slice(&output.stdout)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
 }
 
 fn io_other(error: impl std::fmt::Display) -> io::Error {
@@ -877,6 +1116,8 @@ fn group_sessions(sessions: Vec<SessionItem>) -> Vec<ProjectGroup> {
             let idx = groups.len();
             indexes.insert(key, idx);
             groups.push(ProjectGroup {
+                project_id: session.project_id.clone(),
+                group_id: session.group_id.clone(),
                 name: if groups.is_empty()
                     && session.project_path.as_deref().unwrap_or("").is_empty()
                 {
@@ -897,6 +1138,10 @@ fn switch_rows(groups: &[ProjectGroup]) -> Vec<SwitchRow> {
     let mut rows = Vec::new();
     for group in groups {
         rows.push(SwitchRow::Project(group.name.clone()));
+        rows.push(SwitchRow::NewTerminal {
+            project_id: group.project_id.clone(),
+            group_id: group.group_id.clone(),
+        });
         rows.extend(group.sessions.iter().cloned().map(SwitchRow::Session));
     }
     rows
@@ -911,7 +1156,7 @@ fn shell_quote(value: &str) -> String {
 }
 
 fn header_area(full: Rect) -> Rect {
-    Rect::new(full.x, full.y, full.width, full.height.min(2))
+    Rect::new(full.x, full.y, full.width, full.height.min(3))
 }
 
 fn terminal_area(full: Rect) -> Rect {
@@ -999,6 +1244,87 @@ fn wrap_index(index: isize, len: usize) -> usize {
     (((index % len) + len) % len) as usize
 }
 
+fn encode_mouse_scroll(
+    kind: MouseEventKind,
+    column: u16,
+    row: u16,
+    modifiers: KeyModifiers,
+    encoding: vt100::MouseProtocolEncoding,
+) -> Option<Vec<u8>> {
+    let button = match kind {
+        MouseEventKind::ScrollUp => 64u16,
+        MouseEventKind::ScrollDown => 65u16,
+        _ => return None,
+    };
+    encode_mouse_cb(button, false, column, row, modifiers, encoding)
+}
+
+fn encode_mouse_cb(
+    base_button: u16,
+    release: bool,
+    column: u16,
+    row: u16,
+    modifiers: KeyModifiers,
+    encoding: vt100::MouseProtocolEncoding,
+) -> Option<Vec<u8>> {
+    let mut cb = match (encoding, release) {
+        (vt100::MouseProtocolEncoding::Sgr, true) => base_button,
+        (_, true) => 3,
+        (_, false) => base_button,
+    };
+    if modifiers.contains(KeyModifiers::SHIFT) {
+        cb += 4;
+    }
+    if modifiers.contains(KeyModifiers::ALT) {
+        cb += 8;
+    }
+    if modifiers.contains(KeyModifiers::CONTROL) {
+        cb += 16;
+    }
+    let column = column as u32 + 1;
+    let row = row as u32 + 1;
+    match encoding {
+        vt100::MouseProtocolEncoding::Sgr => Some(
+            format!(
+                "\x1b[<{cb};{column};{row}{}",
+                if release { 'm' } else { 'M' }
+            )
+            .into_bytes(),
+        ),
+        vt100::MouseProtocolEncoding::Default => {
+            let cb = u8::try_from(cb + 32).ok()?;
+            let column = u8::try_from(column + 32).ok()?;
+            let row = u8::try_from(row + 32).ok()?;
+            Some(vec![0x1b, b'[', b'M', cb, column, row])
+        }
+        vt100::MouseProtocolEncoding::Utf8 => {
+            let mut bytes = Vec::with_capacity(16);
+            bytes.extend_from_slice(b"\x1b[M");
+            push_mouse_codepoint(&mut bytes, cb as u32 + 32)?;
+            push_mouse_codepoint(&mut bytes, column + 32)?;
+            push_mouse_codepoint(&mut bytes, row + 32)?;
+            Some(bytes)
+        }
+    }
+}
+
+fn push_mouse_codepoint(bytes: &mut Vec<u8>, value: u32) -> Option<()> {
+    let ch = char::from_u32(value)?;
+    let mut buf = [0u8; 4];
+    bytes.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+    Some(())
+}
+
+fn encode_alternate_scroll(kind: MouseEventKind, application_cursor: bool) -> Option<Vec<u8>> {
+    match (kind, application_cursor) {
+        (MouseEventKind::ScrollUp, true) => Some(b"\x1bOA".to_vec()),
+        (MouseEventKind::ScrollDown, true) => Some(b"\x1bOB".to_vec()),
+        (MouseEventKind::ScrollUp, false) => Some(b"\x1b[A".to_vec()),
+        (MouseEventKind::ScrollDown, false) => Some(b"\x1b[B".to_vec()),
+        _ => None,
+    }
+}
+
 fn encode_key(key: KeyEvent) -> Option<Vec<u8>> {
     match key.code {
         KeyCode::Char(ch) if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -1034,6 +1360,7 @@ mod tests {
             activity: None,
             agent: Some("codex".to_string()),
             project_id: Some(project_id.to_string()),
+            group_id: Some(format!("{project_id}-group")),
             project_name: Some(project_id.to_string()),
             project_path: Some(format!("/{project_id}")),
             session_id: format!("{project_id}-{title}"),
@@ -1064,37 +1391,41 @@ mod tests {
     fn switcher_left_right_jump_to_project_first_sessions() {
         let mut app = test_app(vec![
             ProjectGroup {
+                project_id: Some("alpha".to_string()),
+                group_id: Some("alpha-group".to_string()),
                 name: "alpha".to_string(),
                 sessions: vec![test_session("alpha", "one"), test_session("alpha", "two")],
             },
             ProjectGroup {
+                project_id: Some("beta".to_string()),
+                group_id: Some("beta-group".to_string()),
                 name: "beta".to_string(),
                 sessions: vec![test_session("beta", "one"), test_session("beta", "two")],
             },
             ProjectGroup {
+                project_id: Some("gamma".to_string()),
+                group_id: Some("gamma-group".to_string()),
                 name: "gamma".to_string(),
                 sessions: vec![test_session("gamma", "one")],
             },
         ]);
 
+        app.selected_row_index = 2;
+        app.sync_selected_session_index_from_row();
         app.select_delta(1);
-        assert_eq!(app.selected_session_index, 1);
+        assert_eq!(app.selected_row_index, 3);
 
         app.select_project_delta(1);
-        assert_eq!(app.selected_session_index, 2);
-        assert_eq!(app.selected_row_index, 4);
+        assert_eq!(app.selected_row_index, 6);
 
         app.select_project_delta(1);
-        assert_eq!(app.selected_session_index, 4);
-        assert_eq!(app.selected_row_index, 7);
+        assert_eq!(app.selected_row_index, 10);
 
         app.select_project_delta(1);
-        assert_eq!(app.selected_session_index, 0);
-        assert_eq!(app.selected_row_index, 1);
+        assert_eq!(app.selected_row_index, 2);
 
         app.select_project_delta(-1);
-        assert_eq!(app.selected_session_index, 4);
-        assert_eq!(app.selected_row_index, 7);
+        assert_eq!(app.selected_row_index, 10);
     }
 
     #[test]
@@ -1138,6 +1469,8 @@ mod tests {
     #[test]
     fn activity_counts_follow_refreshed_rows() {
         let app = test_app(vec![ProjectGroup {
+            project_id: Some("alpha".to_string()),
+            group_id: Some("alpha-group".to_string()),
             name: "alpha".to_string(),
             sessions: vec![
                 SessionItem {
