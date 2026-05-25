@@ -358,6 +358,7 @@ struct App {
     active_session: Option<SessionItem>,
     context_menu: Option<ContextMenu>,
     input_prompt: Option<InputPrompt>,
+    show_hotkeys: bool,
     pty: Option<PtySession>,
     mode: Mode,
     switch_scroll: usize,
@@ -377,6 +378,7 @@ impl App {
             active_session: None,
             context_menu: None,
             input_prompt: None,
+            show_hotkeys: false,
             pty: None,
             mode: Mode::Switcher,
             switch_scroll: 0,
@@ -770,6 +772,9 @@ fn render(frame: &mut Frame, app: &mut App) {
     if let Some(prompt) = app.input_prompt.as_ref() {
         render_input_prompt(frame, prompt, area);
     }
+    if app.show_hotkeys {
+        render_hotkeys_overlay(frame, area);
+    }
 }
 
 fn render_header(frame: &mut Frame, app: &App, area: Rect) {
@@ -798,6 +803,12 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
     The TUI title bar sits at the bottom of the screen, so its separator must
     render on the top edge instead of below the bar to divide session output
     from Ghostex controls.
+
+    CDXC:GhostexTui 2026-05-26-09:10:
+    In switcher mode, replace the left title area with a Hotkeys button that
+    opens the shortcuts overlay. The switcher already shows session context,
+    so repeating the Ghostex/title label is less useful than discoverable TUI
+    controls.
     */
     let header_style = Style::default().bg(Color::Rgb(24, 24, 37));
     frame.render_widget(Clear, area);
@@ -806,6 +817,20 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
     let status_width = area.width.saturating_sub(switch_width);
     let status = Rect::new(area.x, area.y, status_width, area.height);
     let switch = switch_button_rect(area);
+    if app.mode == Mode::Switcher {
+        frame.render_widget(
+            Paragraph::new("Hotkeys")
+                .style(
+                    Style::default()
+                        .fg(Color::White)
+                        .bg(Color::Rgb(49, 50, 68))
+                        .add_modifier(Modifier::BOLD),
+                )
+                .alignment(Alignment::Center)
+                .block(Block::default().borders(Borders::RIGHT)),
+            hotkeys_button_rect(area),
+        );
+    }
     let title = app
         .active_session
         .as_ref()
@@ -860,17 +885,19 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
             ),
         );
     }
-    frame.render_widget(
-        Paragraph::new(Line::from(title_spans))
-            .style(header_style)
-            .wrap(Wrap { trim: false }),
-        Rect::new(
-            status.x,
-            status.y + 1,
-            title_width,
-            area.height.saturating_sub(1),
-        ),
-    );
+    if app.mode == Mode::Attached {
+        frame.render_widget(
+            Paragraph::new(Line::from(title_spans))
+                .style(header_style)
+                .wrap(Wrap { trim: false }),
+            Rect::new(
+                status.x,
+                status.y + 1,
+                title_width,
+                area.height.saturating_sub(1),
+            ),
+        );
+    }
     frame.render_widget(
         Paragraph::new(match app.mode {
             Mode::Attached => "switch\nsession",
@@ -1227,7 +1254,79 @@ fn render_input_prompt(frame: &mut Frame, prompt: &InputPrompt, full: Rect) {
     );
 }
 
+fn render_hotkeys_overlay(frame: &mut Frame, full: Rect) {
+    /*
+    CDXC:GhostexTui 2026-05-26-09:10:
+    The switcher hotkeys button should open an in-TUI reference for every
+    current keyboard shortcut. Keep this overlay read-only and dismissible so
+    it does not introduce a settings surface or change terminal input behavior.
+    */
+    let width = full.width.min(54).max(32);
+    let area = centered_rect(width, 14, full);
+    frame.render_widget(Clear, area);
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("Ctrl+Q", Style::default().fg(Color::Rgb(137, 180, 250))),
+            Span::raw("  Quit GTX TUI"),
+        ]),
+        Line::from(vec![
+            Span::styled("Ctrl+S", Style::default().fg(Color::Rgb(137, 180, 250))),
+            Span::raw("  Open switcher from attached session"),
+        ]),
+        Line::from(vec![
+            Span::styled("Ctrl+K", Style::default().fg(Color::Rgb(137, 180, 250))),
+            Span::raw("  Open context menu"),
+        ]),
+        Line::from(vec![
+            Span::styled("Esc", Style::default().fg(Color::Rgb(137, 180, 250))),
+            Span::raw("     Close overlay/menu, or return to session"),
+        ]),
+        Line::from(vec![
+            Span::styled("Up/Down", Style::default().fg(Color::Rgb(137, 180, 250))),
+            Span::raw(" Move selection"),
+        ]),
+        Line::from(vec![
+            Span::styled("Left/Right", Style::default().fg(Color::Rgb(137, 180, 250))),
+            Span::raw(" Jump projects"),
+        ]),
+        Line::from(vec![
+            Span::styled("PgUp/PgDn", Style::default().fg(Color::Rgb(137, 180, 250))),
+            Span::raw(" Jump 5 rows"),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "Enter/Space",
+                Style::default().fg(Color::Rgb(137, 180, 250)),
+            ),
+            Span::raw(" Attach, create, or confirm"),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Click anywhere or press Esc to close",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(Style::default().fg(Color::White).bg(Color::Rgb(24, 24, 37)))
+            .block(
+                Block::default()
+                    .title(" Hotkeys ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Rgb(137, 180, 250))),
+            ),
+        area,
+    );
+}
+
 fn handle_key(app: &mut App, key: KeyEvent, terminal_rect: Rect) -> bool {
+    if app.show_hotkeys {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('q')) {
+            return true;
+        }
+        app.show_hotkeys = false;
+        return false;
+    }
     if app.input_prompt.is_some() {
         return handle_input_prompt_key(app, key);
     }
@@ -1335,6 +1434,12 @@ fn handle_input_prompt_key(app: &mut App, key: KeyEvent) -> bool {
 }
 
 fn handle_mouse(app: &mut App, mouse: MouseEvent, full: Rect, terminal_rect: Rect) -> bool {
+    if app.show_hotkeys {
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            app.show_hotkeys = false;
+        }
+        return false;
+    }
     match app.mode {
         Mode::Attached => {
             if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
@@ -1358,6 +1463,15 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, full: Rect, terminal_rect: Rec
             }
         }
         Mode::Switcher => match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left)
+                if rect_contains(
+                    hotkeys_button_rect(header_area(full)),
+                    mouse.column,
+                    mouse.row,
+                ) =>
+            {
+                app.show_hotkeys = true;
+            }
             MouseEventKind::Down(MouseButton::Left)
                 if rect_contains(
                     switch_button_rect(header_area(full)),
@@ -1909,6 +2023,18 @@ fn switch_button_rect(header: Rect) -> Rect {
     )
 }
 
+fn hotkeys_button_rect(header: Rect) -> Rect {
+    let switch_width = 12u16.min(header.width);
+    let available_width = header.width.saturating_sub(switch_width);
+    let width = 14u16.min(available_width);
+    Rect::new(
+        header.x,
+        header.y + 1,
+        width,
+        header.height.saturating_sub(1).min(2),
+    )
+}
+
 fn rect_contains(rect: Rect, col: u16, row: u16) -> bool {
     rect.width > 0
         && rect.height > 0
@@ -2171,6 +2297,7 @@ mod tests {
             active_session: None,
             context_menu: None,
             input_prompt: None,
+            show_hotkeys: false,
             pty: None,
             mode: Mode::Switcher,
             switch_scroll: 0,
