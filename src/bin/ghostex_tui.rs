@@ -1372,24 +1372,38 @@ fn handle_switch_action(app: &mut App, terminal_rect: Rect) {
         Some(SwitchAction::NewTerminal {
             project_id,
             group_id,
-        }) => match create_terminal(project_id.as_deref(), group_id.as_deref()) {
-            Ok(created) => {
-                app.status.clear();
-                app.refresh_sessions(false);
-                if let Some(session_id) = created
-                    .session
-                    .and_then(|session| session.ghostex_id.or(session.session_id))
-                {
-                    if let Some(row_index) = app.row_index_for_session_id(&session_id) {
-                        app.selected_row_index = row_index;
-                        app.sync_selected_session_index_from_row();
+        }) => {
+            match create_terminal(project_id.as_deref(), group_id.as_deref()) {
+                Ok(created) => {
+                    /*
+                    CDXC:GhostexTui 2026-05-25-18:05:
+                    Selecting "Create new terminal" should immediately attach to
+                    the created session. Refresh the macOS sidebar inventory first
+                    so attachment still uses the same sidebar-ordered session model
+                    and `zmx attach` path as selecting an existing session.
+                    */
+                    app.status.clear();
+                    app.refresh_sessions(false);
+                    if let Some(session_id) = created
+                        .session
+                        .and_then(|session| session.ghostex_id.or(session.session_id))
+                    {
+                        if let Some(row_index) = app.row_index_for_session_id(&session_id) {
+                            app.selected_row_index = row_index;
+                            app.sync_selected_session_index_from_row();
+                            if let Some(session) = app.session_by_id(&session_id).cloned() {
+                                app.attach(session, terminal_rect);
+                            }
+                        } else {
+                            app.status = "Created terminal, but it was not found in the refreshed session list.".to_string();
+                        }
                     }
                 }
+                Err(err) => {
+                    app.status = format!("Could not create terminal: {err}");
+                }
             }
-            Err(err) => {
-                app.status = format!("Could not create terminal: {err}");
-            }
-        },
+        }
         None => {}
     }
 }
