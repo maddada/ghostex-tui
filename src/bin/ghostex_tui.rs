@@ -177,9 +177,14 @@ impl App {
             status: String::new(),
         };
         app.refresh_sessions();
-        if let Some(first) = app.session_at(0).cloned() {
-            app.attach(first, area);
-        }
+        /*
+        CDXC:GhostexTui 2026-05-25-15:11:
+        Bare `gtx` should open on the project/session switcher, not auto-attach
+        the first sidebar session. Session PTYs are spawned only after the user
+        clicks a row or presses Enter/Space, so saved resume-command output from
+        an arbitrary first session cannot appear as launch errors.
+        */
+        let _ = area;
         app
     }
 
@@ -493,7 +498,7 @@ fn handle_key(app: &mut App, key: KeyEvent, terminal_rect: Rect) -> bool {
     }
     match app.mode {
         Mode::Switcher => match key.code {
-            KeyCode::Esc => app.mode = Mode::Attached,
+            KeyCode::Esc if app.active_session.is_some() => app.mode = Mode::Attached,
             KeyCode::Up => app.select_delta(-1),
             KeyCode::Down => app.select_delta(1),
             KeyCode::PageUp => app.select_delta(-5),
