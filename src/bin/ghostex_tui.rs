@@ -426,13 +426,16 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
 fn render_terminal(frame: &mut Frame, app: &mut App, area: Rect) {
     if let Some(pty) = app.pty.as_mut() {
         let screen = pty.parser.screen();
-        for (row, line) in screen.rows(0, area.width).enumerate() {
-            let row = row as u16;
-            if row >= area.height {
-                break;
-            }
+        /*
+        CDXC:GhostexTui 2026-05-25-16:00:
+        Ghostex TUI attaches through `zmx`, unlike Herdr's native pane runtime,
+        but the PTY parser still stores ANSI attributes per cell. Render cells
+        as styled spans instead of `screen.rows(...)` so Codex, Starship, and
+        CLI color output keep foreground, background, truecolor, and text modes.
+        */
+        for row in 0..area.height {
             frame.render_widget(
-                Paragraph::new(line),
+                Paragraph::new(Line::from(render_terminal_row(screen, row, area.width))),
                 Rect::new(area.x, area.y + row, area.width, 1),
             );
         }
@@ -441,6 +444,74 @@ fn render_terminal(frame: &mut Frame, app: &mut App, area: Rect) {
             Paragraph::new(app.status.as_str()).style(Style::default().fg(Color::Red)),
             area,
         );
+    }
+}
+
+fn render_terminal_row(screen: &vt100::Screen, row: u16, width: u16) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut current_text = String::new();
+    let mut current_style: Option<Style> = None;
+    for col in 0..width {
+        let Some(cell) = screen.cell(row, col) else {
+            push_terminal_span(&mut spans, &mut current_text, &mut current_style);
+            continue;
+        };
+        if cell.is_wide_continuation() {
+            continue;
+        }
+        let style = terminal_cell_style(cell);
+        if current_style.is_some_and(|existing| existing != style) {
+            push_terminal_span(&mut spans, &mut current_text, &mut current_style);
+        }
+        current_style = Some(style);
+        if cell.has_contents() {
+            current_text.push_str(&cell.contents());
+        } else {
+            current_text.push(' ');
+        }
+    }
+    push_terminal_span(&mut spans, &mut current_text, &mut current_style);
+    spans
+}
+
+fn push_terminal_span(
+    spans: &mut Vec<Span<'static>>,
+    current_text: &mut String,
+    current_style: &mut Option<Style>,
+) {
+    if current_text.is_empty() {
+        return;
+    }
+    spans.push(Span::styled(
+        std::mem::take(current_text),
+        current_style.take().unwrap_or_default(),
+    ));
+}
+
+fn terminal_cell_style(cell: &vt100::Cell) -> Style {
+    let mut fg = terminal_color(cell.fgcolor());
+    let mut bg = terminal_color(cell.bgcolor());
+    if cell.inverse() {
+        std::mem::swap(&mut fg, &mut bg);
+    }
+    let mut style = Style::default().fg(fg).bg(bg);
+    if cell.bold() {
+        style = style.add_modifier(Modifier::BOLD);
+    }
+    if cell.italic() {
+        style = style.add_modifier(Modifier::ITALIC);
+    }
+    if cell.underline() {
+        style = style.add_modifier(Modifier::UNDERLINED);
+    }
+    style
+}
+
+fn terminal_color(color: vt100::Color) -> Color {
+    match color {
+        vt100::Color::Default => Color::Reset,
+        vt100::Color::Idx(index) => Color::Indexed(index),
+        vt100::Color::Rgb(red, green, blue) => Color::Rgb(red, green, blue),
     }
 }
 
@@ -752,5 +823,33 @@ fn encode_key(key: KeyEvent) -> Option<Vec<u8>> {
         KeyCode::Home => Some(b"\x1b[H".to_vec()),
         KeyCode::End => Some(b"\x1b[F".to_vec()),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_row_preserves_ansi_colors_and_modes() {
+        let mut parser = vt100::Parser::new(2, 80, 0);
+        parser.process(
+            b"\x1b[31mred\x1b[0m \x1b[1;35mbold-purple\x1b[0m \x1b[38;2;80;180;255mtruecolor\x1b[0m",
+        );
+
+        let spans = render_terminal_row(parser.screen(), 0, 80);
+
+        assert!(spans
+            .iter()
+            .any(|span| span.content.as_ref() == "red" && span.style.fg == Some(Color::Indexed(1))));
+        assert!(spans.iter().any(|span| {
+            span.content.as_ref() == "bold-purple"
+                && span.style.fg == Some(Color::Indexed(5))
+                && span.style.add_modifier.contains(Modifier::BOLD)
+        }));
+        assert!(spans.iter().any(|span| {
+            span.content.as_ref() == "truecolor"
+                && span.style.fg == Some(Color::Rgb(80, 180, 255))
+        }));
     }
 }
