@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::io::{self, Read, Write};
 use std::process::Command;
 use std::sync::mpsc;
@@ -23,12 +23,22 @@ use ratatui::{Frame, Terminal};
 use serde::Deserialize;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(16);
-const SESSION_LIST_REFRESH: Duration = Duration::from_secs(3);
+const SESSION_LIST_REFRESH: Duration = Duration::from_secs(5);
 const GHOSTEX_TUI_TERM: &str = "xterm-256color";
 const GHOSTEX_TUI_COLORTERM: &str = "truecolor";
+const WORKING_COLOR: Color = Color::Rgb(248, 173, 7);
+const ATTENTION_COLOR: Color = Color::Rgb(115, 231, 156);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionActivity {
+    Attention,
+    Working,
+}
 
 #[derive(Debug, Deserialize, Clone)]
 struct SessionItem {
+    #[serde(default)]
+    activity: Option<String>,
     #[serde(default)]
     agent: Option<String>,
     #[serde(default, rename = "projectId")]
@@ -39,6 +49,8 @@ struct SessionItem {
     project_path: Option<String>,
     #[serde(default, rename = "sessionId")]
     session_id: String,
+    #[serde(default)]
+    status: String,
     #[serde(default)]
     title: String,
 }
@@ -171,6 +183,8 @@ struct App {
     mode: Mode,
     switch_scroll: usize,
     last_refresh: Instant,
+    known_attention_session_ids: HashSet<String>,
+    has_loaded_session_statuses: bool,
     status: String,
 }
 
@@ -186,9 +200,11 @@ impl App {
             mode: Mode::Switcher,
             switch_scroll: 0,
             last_refresh: Instant::now() - SESSION_LIST_REFRESH,
+            known_attention_session_ids: HashSet::new(),
+            has_loaded_session_statuses: false,
             status: String::new(),
         };
-        app.refresh_sessions();
+        app.refresh_sessions(false);
         /*
         CDXC:GhostexTui 2026-05-25-15:11:
         Bare `gtx` should open on the project/session switcher, not auto-attach
@@ -200,13 +216,55 @@ impl App {
         app
     }
 
-    fn refresh_sessions(&mut self) {
+    fn refresh_sessions(&mut self, bell_on_new_attention: bool) {
         match fetch_sessions() {
             Ok(sessions) => {
+                /*
+                CDXC:GhostexTui 2026-05-25-16:22:
+                The TUI polls Ghostex sidebar inventory every five seconds so
+                switcher dots, attached-view counts, and bell notifications use
+                the macOS app's activity source of truth instead of zmx state.
+                */
+                let next_attention_session_ids = attention_session_ids(&sessions);
+                if bell_on_new_attention
+                    && self.has_loaded_session_statuses
+                    && next_attention_session_ids
+                        .difference(&self.known_attention_session_ids)
+                        .next()
+                        .is_some()
+                {
+                    emit_terminal_bell();
+                }
+                self.known_attention_session_ids = next_attention_session_ids;
+                self.has_loaded_session_statuses = true;
+                let selected_session_id = self
+                    .session_at(self.selected_session_index)
+                    .map(|session| session.session_id.clone());
+                let active_session_id = self
+                    .active_session
+                    .as_ref()
+                    .map(|session| session.session_id.clone());
                 self.groups = group_sessions(sessions);
                 self.rows = switch_rows(&self.groups);
+                if let Some(selected_session_id) = selected_session_id {
+                    self.selected_session_index = self
+                        .session_index_for_session_id(&selected_session_id)
+                        .unwrap_or_else(|| {
+                            self.selected_session_index
+                                .min(self.session_count().saturating_sub(1))
+                        });
+                } else {
+                    self.selected_session_index = self
+                        .selected_session_index
+                        .min(self.session_count().saturating_sub(1));
+                }
                 self.selected_row_index =
                     self.row_index_for_session_index(self.selected_session_index);
+                if let Some(active_session_id) = active_session_id {
+                    if let Some(session) = self.session_by_id(&active_session_id).cloned() {
+                        self.active_session = Some(session);
+                    }
+                }
                 self.last_refresh = Instant::now();
                 if self.groups.is_empty() {
                     self.status = "No Ghostex sessions found.".to_string();
@@ -219,8 +277,8 @@ impl App {
     }
 
     fn maybe_refresh_sessions(&mut self) {
-        if self.mode == Mode::Switcher && self.last_refresh.elapsed() >= SESSION_LIST_REFRESH {
-            self.refresh_sessions();
+        if self.last_refresh.elapsed() >= SESSION_LIST_REFRESH {
+            self.refresh_sessions(true);
         }
     }
 
@@ -253,6 +311,36 @@ impl App {
         self.rows
             .iter()
             .filter(|row| matches!(row, SwitchRow::Session(_)))
+            .count()
+    }
+
+    fn session_by_id(&self, session_id: &str) -> Option<&SessionItem> {
+        self.rows.iter().find_map(|row| match row {
+            SwitchRow::Session(session) if session.session_id == session_id => Some(session),
+            _ => None,
+        })
+    }
+
+    fn session_index_for_session_id(&self, session_id: &str) -> Option<usize> {
+        let mut seen = 0usize;
+        for row in &self.rows {
+            if let SwitchRow::Session(session) = row {
+                if session.session_id == session_id {
+                    return Some(seen);
+                }
+                seen += 1;
+            }
+        }
+        None
+    }
+
+    fn activity_count(&self, activity: SessionActivity) -> usize {
+        self.rows
+            .iter()
+            .filter(|row| match row {
+                SwitchRow::Session(session) => session_activity(session) == Some(activity),
+                SwitchRow::Project(_) => false,
+            })
             .count()
     }
 
@@ -430,21 +518,28 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
         .as_ref()
         .map(project_label)
         .unwrap_or_else(|| "Ghostex".to_string());
+    let mut title_spans = vec![
+        Span::styled(
+            " Ghostex ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Rgb(137, 180, 250))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            title.to_string(),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if app.mode == Mode::Attached {
+        title_spans.extend(activity_count_spans(
+            app.activity_count(SessionActivity::Working),
+            app.activity_count(SessionActivity::Attention),
+        ));
+    }
     frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                " Ghostex ",
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Rgb(137, 180, 250))
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" "),
-            Span::styled(
-                title.to_string(),
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-        ])),
+        Paragraph::new(Line::from(title_spans)),
         Rect::new(status.x, status.y, status.width, 1),
     );
     frame.render_widget(
@@ -557,6 +652,65 @@ fn terminal_color(color: vt100::Color) -> Color {
     }
 }
 
+fn activity_dot_span(session: &SessionItem, bg: Color) -> Span<'static> {
+    match session_activity(session) {
+        Some(activity) => Span::styled(" ●", Style::default().fg(activity_color(activity)).bg(bg)),
+        None => Span::styled("  ", Style::default().bg(bg)),
+    }
+}
+
+fn activity_count_spans(working_count: usize, attention_count: usize) -> Vec<Span<'static>> {
+    vec![
+        Span::raw("   "),
+        Span::styled("●", Style::default().fg(WORKING_COLOR)),
+        Span::styled(
+            format!(" {working_count} working"),
+            Style::default().fg(Color::White),
+        ),
+        Span::raw("  "),
+        Span::styled("●", Style::default().fg(ATTENTION_COLOR)),
+        Span::styled(
+            format!(" {attention_count} attention"),
+            Style::default().fg(Color::White),
+        ),
+    ]
+}
+
+fn activity_color(activity: SessionActivity) -> Color {
+    match activity {
+        SessionActivity::Attention => ATTENTION_COLOR,
+        SessionActivity::Working => WORKING_COLOR,
+    }
+}
+
+fn session_activity(session: &SessionItem) -> Option<SessionActivity> {
+    let value = session
+        .activity
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(session.status.as_str())
+        .trim()
+        .to_lowercase();
+    match value.as_str() {
+        "attention" => Some(SessionActivity::Attention),
+        "working" => Some(SessionActivity::Working),
+        _ => None,
+    }
+}
+
+fn attention_session_ids(sessions: &[SessionItem]) -> HashSet<String> {
+    sessions
+        .iter()
+        .filter(|session| session_activity(session) == Some(SessionActivity::Attention))
+        .map(|session| session.session_id.clone())
+        .collect()
+}
+
+fn emit_terminal_bell() {
+    let _ = io::stdout().write_all(b"\x07");
+    let _ = io::stdout().flush();
+}
+
 fn render_switcher(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(Clear, area);
     app.keep_selected_visible(area);
@@ -580,7 +734,8 @@ fn render_switcher(frame: &mut Frame, app: &mut App, area: Rect) {
                 } else {
                     Color::Reset
                 };
-                ListItem::new(Line::from(vec![
+                let mut spans = vec![
+                    activity_dot_span(session, bg),
                     Span::styled(
                         format!("  [{}] ", agent_indicator(session)),
                         Style::default().fg(agent_color(session)).bg(bg),
@@ -596,8 +751,8 @@ fn render_switcher(frame: &mut Frame, app: &mut App, area: Rect) {
                                 Modifier::empty()
                             }),
                     ),
-                ]))
-                .style(Style::default().bg(bg))
+                ];
+                ListItem::new(Line::from(std::mem::take(&mut spans))).style(Style::default().bg(bg))
             }
         })
         .collect::<Vec<_>>();
@@ -642,7 +797,7 @@ fn handle_key(app: &mut App, key: KeyEvent, terminal_rect: Rect) -> bool {
                 && matches!(key.code, KeyCode::Char('s'))
             {
                 app.mode = Mode::Switcher;
-                app.refresh_sessions();
+                app.refresh_sessions(false);
                 return false;
             }
             if let Some(bytes) = encode_key(key) {
@@ -666,7 +821,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, full: Rect, terminal_rect: Rec
                 )
             {
                 app.mode = Mode::Switcher;
-                app.refresh_sessions();
+                app.refresh_sessions(false);
             }
         }
         Mode::Switcher => match mouse.kind {
@@ -876,11 +1031,13 @@ mod tests {
 
     fn test_session(project_id: &str, title: &str) -> SessionItem {
         SessionItem {
+            activity: None,
             agent: Some("codex".to_string()),
             project_id: Some(project_id.to_string()),
             project_name: Some(project_id.to_string()),
             project_path: Some(format!("/{project_id}")),
             session_id: format!("{project_id}-{title}"),
+            status: "idle".to_string(),
             title: title.to_string(),
         }
     }
@@ -897,6 +1054,8 @@ mod tests {
             mode: Mode::Switcher,
             switch_scroll: 0,
             last_refresh: Instant::now(),
+            known_attention_session_ids: HashSet::new(),
+            has_loaded_session_statuses: true,
             status: String::new(),
         }
     }
@@ -947,17 +1106,53 @@ mod tests {
 
         let spans = render_terminal_row(parser.screen(), 0, 80);
 
-        assert!(spans
-            .iter()
-            .any(|span| span.content.as_ref() == "red" && span.style.fg == Some(Color::Indexed(1))));
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.content.as_ref() == "red"
+                    && span.style.fg == Some(Color::Indexed(1)))
+        );
         assert!(spans.iter().any(|span| {
             span.content.as_ref() == "bold-purple"
                 && span.style.fg == Some(Color::Indexed(5))
                 && span.style.add_modifier.contains(Modifier::BOLD)
         }));
         assert!(spans.iter().any(|span| {
-            span.content.as_ref() == "truecolor"
-                && span.style.fg == Some(Color::Rgb(80, 180, 255))
+            span.content.as_ref() == "truecolor" && span.style.fg == Some(Color::Rgb(80, 180, 255))
         }));
+    }
+
+    #[test]
+    fn session_activity_prefers_sidebar_activity_over_lifecycle_status() {
+        let mut session = test_session("alpha", "one");
+        session.status = "done".to_string();
+        session.activity = Some("attention".to_string());
+
+        assert_eq!(session_activity(&session), Some(SessionActivity::Attention));
+
+        session.activity = None;
+        session.status = "working".to_string();
+        assert_eq!(session_activity(&session), Some(SessionActivity::Working));
+    }
+
+    #[test]
+    fn activity_counts_follow_refreshed_rows() {
+        let app = test_app(vec![ProjectGroup {
+            name: "alpha".to_string(),
+            sessions: vec![
+                SessionItem {
+                    activity: Some("working".to_string()),
+                    ..test_session("alpha", "working")
+                },
+                SessionItem {
+                    activity: Some("attention".to_string()),
+                    ..test_session("alpha", "attention")
+                },
+                test_session("alpha", "idle"),
+            ],
+        }]);
+
+        assert_eq!(app.activity_count(SessionActivity::Working), 1);
+        assert_eq!(app.activity_count(SessionActivity::Attention), 1);
     }
 }
