@@ -809,6 +809,10 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
     opens the shortcuts overlay. The switcher already shows session context,
     so repeating the Ghostex/title label is less useful than discoverable TUI
     controls.
+
+    CDXC:GhostexTui 2026-05-26-03:39:
+    Attached-view working/attention totals belong on the second content line,
+    right-aligned with exactly one column of margin before the switch control.
     */
     let header_style = Style::default().bg(Color::Rgb(24, 24, 37));
     frame.render_widget(Clear, area);
@@ -836,17 +840,18 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
         .as_ref()
         .map(|session| session.title.as_str())
         .unwrap_or("No session");
+    let count_right_margin = 1u16;
     let count_width = if app.mode == Mode::Attached {
         activity_count_width(
             app.activity_count(SessionActivity::Working),
             app.activity_count(SessionActivity::Attention),
         )
-        .min(status_width)
+        .min(status_width.saturating_sub(count_right_margin))
     } else {
         0
     };
     let title_width = status_width
-        .saturating_sub(count_width)
+        .saturating_sub(count_width.saturating_add(count_right_margin))
         .max(status_width.min(1));
     let title_spans = vec![
         Span::styled(
@@ -878,8 +883,10 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
                 .style(header_style)
                 .alignment(Alignment::Right),
             Rect::new(
-                status.x + status_width.saturating_sub(count_width),
-                status.y + 1,
+                status.x
+                    + status_width
+                        .saturating_sub(count_width.saturating_add(count_right_margin)),
+                status.y + 2,
                 count_width,
                 1,
             ),
@@ -941,12 +948,38 @@ fn render_terminal(frame: &mut Frame, app: &mut App, area: Rect) {
                 Rect::new(area.x, area.y + row, area.width, 1),
             );
         }
+        render_terminal_cursor(frame, screen, area);
     } else {
         frame.render_widget(
             Paragraph::new(app.status.as_str()).style(Style::default().fg(Color::Red)),
             area,
         );
     }
+}
+
+fn render_terminal_cursor(frame: &mut Frame, screen: &vt100::Screen, area: Rect) {
+    /*
+    CDXC:GhostexTui 2026-05-26-09:18:
+    Attached panes must expose the child terminal cursor like Herdr does.
+    The vt100 cell renderer paints text attributes but not the hardware cursor,
+    so set the frame cursor after rows render and suppress it when the child
+    hides the cursor or the viewport is scrolled back.
+    */
+    let Some((x, y)) = terminal_cursor_position(screen, area) else {
+        return;
+    };
+    frame.set_cursor_position((x, y));
+}
+
+fn terminal_cursor_position(screen: &vt100::Screen, area: Rect) -> Option<(u16, u16)> {
+    if screen.hide_cursor() || screen.scrollback() > 0 {
+        return None;
+    }
+    let (row, col) = screen.cursor_position();
+    if row >= area.height || col >= area.width {
+        return None;
+    }
+    Some((area.x + col, area.y + row))
 }
 
 fn render_terminal_row(screen: &vt100::Screen, row: u16, width: u16) -> Vec<Span<'static>> {
@@ -1037,12 +1070,11 @@ fn activity_count_spans(working_count: usize, attention_count: usize) -> Vec<Spa
             format!(" {attention_count}"),
             Style::default().fg(Color::White),
         ),
-        Span::raw(" "),
     ]
 }
 
 fn activity_count_width(working_count: usize, attention_count: usize) -> u16 {
-    format!("● {working_count}  ● {attention_count} ")
+    format!("● {working_count}  ● {attention_count}")
         .chars()
         .count() as u16
 }
@@ -2375,6 +2407,23 @@ mod tests {
         assert!(spans.iter().any(|span| {
             span.content.as_ref() == "truecolor" && span.style.fg == Some(Color::Rgb(80, 180, 255))
         }));
+    }
+
+    #[test]
+    fn terminal_cursor_position_tracks_visible_vt100_cursor() {
+        let mut parser = vt100::Parser::new(4, 20, 10);
+        parser.process(b"\x1b[3;5H");
+
+        assert_eq!(
+            terminal_cursor_position(parser.screen(), Rect::new(10, 20, 20, 4)),
+            Some((14, 22))
+        );
+
+        parser.process(b"\x1b[?25l");
+        assert_eq!(
+            terminal_cursor_position(parser.screen(), Rect::new(10, 20, 20, 4)),
+            None
+        );
     }
 
     #[test]
