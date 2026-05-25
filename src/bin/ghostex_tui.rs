@@ -197,6 +197,8 @@ struct PtySession {
     writer: Box<dyn Write + Send>,
     rx: mpsc::Receiver<Vec<u8>>,
     parser: vt100::Parser,
+    mouse_alternate_scroll: bool,
+    terminal_mode_buffer: Vec<u8>,
 }
 
 impl PtySession {
@@ -265,6 +267,8 @@ impl PtySession {
             writer,
             rx,
             parser,
+            mouse_alternate_scroll: false,
+            terminal_mode_buffer: Vec::new(),
         })
     }
 
@@ -280,6 +284,11 @@ impl PtySession {
 
     fn drain_output(&mut self) {
         while let Ok(bytes) = self.rx.try_recv() {
+            update_terminal_mode_state(
+                &mut self.terminal_mode_buffer,
+                &mut self.mouse_alternate_scroll,
+                &bytes,
+            );
             self.parser.process(&bytes);
         }
     }
@@ -313,7 +322,7 @@ impl PtySession {
             }
             return;
         }
-        if self.parser.screen().alternate_screen() {
+        if self.parser.screen().alternate_screen() && self.mouse_alternate_scroll {
             if let Some(bytes) =
                 encode_alternate_scroll(mouse.kind, self.parser.screen().application_cursor())
             {
@@ -1955,6 +1964,57 @@ fn wrap_index(index: isize, len: usize) -> usize {
     (((index % len) + len) % len) as usize
 }
 
+fn update_terminal_mode_state(
+    buffer: &mut Vec<u8>,
+    mouse_alternate_scroll: &mut bool,
+    bytes: &[u8],
+) {
+    /*
+    CDXC:GhostexTui 2026-05-25-18:24:
+    Herdr only routes wheel events to alternate-scroll arrow keys when the
+    child enables xterm mode 1007. Track `CSI ? ... 1007 ... h/l` directly from
+    the PTY stream because vt100 exposes alternate screen and mouse reporting
+    but not the mouse-alternate-scroll mode Ghostty uses for wheel routing.
+    */
+    for byte in bytes {
+        if *byte == 0x1b {
+            buffer.clear();
+            buffer.push(*byte);
+            continue;
+        }
+        if buffer.is_empty() {
+            continue;
+        }
+        buffer.push(*byte);
+        if buffer.len() > 128 {
+            buffer.clear();
+            continue;
+        }
+        if matches!(*byte, b'h' | b'l') {
+            if terminal_mode_sequence_contains(buffer, "1007") {
+                *mouse_alternate_scroll = *byte == b'h';
+            }
+            buffer.clear();
+        }
+    }
+}
+
+fn terminal_mode_sequence_contains(buffer: &[u8], needle: &str) -> bool {
+    if !buffer.starts_with(b"\x1b[?") {
+        return false;
+    }
+    let Some(final_byte) = buffer.last().copied() else {
+        return false;
+    };
+    if !matches!(final_byte, b'h' | b'l') {
+        return false;
+    }
+    let params = &buffer[3..buffer.len().saturating_sub(1)];
+    std::str::from_utf8(params)
+        .ok()
+        .is_some_and(|params| params.split(';').any(|param| param == needle))
+}
+
 fn encode_mouse_scroll(
     kind: MouseEventKind,
     column: u16,
@@ -2208,5 +2268,21 @@ mod tests {
 
         assert_eq!(app.activity_count(SessionActivity::Working), 1);
         assert_eq!(app.activity_count(SessionActivity::Attention), 1);
+    }
+
+    #[test]
+    fn terminal_mode_tracking_follows_xterm_alternate_scroll() {
+        let mut buffer = Vec::new();
+        let mut mouse_alternate_scroll = false;
+
+        update_terminal_mode_state(
+            &mut buffer,
+            &mut mouse_alternate_scroll,
+            b"\x1b[?1000;1007h",
+        );
+        assert!(mouse_alternate_scroll);
+
+        update_terminal_mode_state(&mut buffer, &mut mouse_alternate_scroll, b"\x1b[?1007l");
+        assert!(!mouse_alternate_scroll);
     }
 }
