@@ -772,6 +772,11 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
     When the user is already on the switcher, the top-right control should
     become the exit affordance and read "Quit GTX TUI" instead of offering to
     switch sessions again.
+
+    CDXC:GhostexTui 2026-05-25-17:58:
+    The switcher quit label should keep "Quit" on the first row and "GTX TUI"
+    on the second row, while attached activity counters reserve one trailing
+    space before the switch button so the attention count does not touch it.
     */
     let header_style = Style::default().bg(Color::Rgb(24, 24, 37));
     frame.render_widget(Clear, area);
@@ -848,7 +853,7 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(
         Paragraph::new(match app.mode {
             Mode::Attached => "switch\nsession",
-            Mode::Switcher => "Quit GTX\nTUI",
+            Mode::Switcher => "Quit\nGTX TUI",
         })
         .style(
             Style::default()
@@ -985,11 +990,12 @@ fn activity_count_spans(working_count: usize, attention_count: usize) -> Vec<Spa
             format!(" {attention_count}"),
             Style::default().fg(Color::White),
         ),
+        Span::raw(" "),
     ]
 }
 
 fn activity_count_width(working_count: usize, attention_count: usize) -> u16 {
-    format!("● {working_count}  ● {attention_count}")
+    format!("● {working_count}  ● {attention_count} ")
         .chars()
         .count() as u16
 }
@@ -1073,9 +1079,13 @@ fn render_switcher(frame: &mut Frame, app: &mut App, area: Rect) {
                 The create-terminal row should read "Create new terminal" in a
                 lighter color and without a leading plus, so it feels like a
                 quiet project action rather than another agent/session row.
+
+                CDXC:GhostexTui 2026-05-25-17:58:
+                Indent the create-terminal action two more columns than the
+                first implementation so it reads as a nested project command.
                 */
                 ListItem::new(Line::from(Span::styled(
-                    "  Create new terminal",
+                    "    Create new terminal",
                     Style::default()
                         .fg(Color::Rgb(205, 214, 244))
                         .bg(bg)
