@@ -596,7 +596,11 @@ fn main() -> io::Result<()> {
                         break;
                     }
                 }
-                Event::Mouse(mouse) => handle_mouse(&mut app, mouse, size, terminal_rect),
+                Event::Mouse(mouse) => {
+                    if handle_mouse(&mut app, mouse, size, terminal_rect) {
+                        break;
+                    }
+                }
                 Event::Resize(_, _) => {}
                 _ => {}
             }
@@ -626,6 +630,11 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
     The header title may wrap onto the second content row while activity counts
     stay below it on the right. Keep the switch affordance two rows tall and
     label it as "switch session" with one word per row.
+
+    CDXC:GhostexTui 2026-05-25-17:48:
+    When the user is already on the switcher, the top-right control should
+    become the exit affordance and read "Quit GTX TUI" instead of offering to
+    switch sessions again.
     */
     let header_style = Style::default().bg(Color::Rgb(24, 24, 37));
     frame.render_widget(Clear, area);
@@ -700,15 +709,18 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
         ),
     );
     frame.render_widget(
-        Paragraph::new("switch\nsession")
-            .style(
-                Style::default()
-                    .fg(Color::White)
-                    .bg(Color::Rgb(49, 50, 68))
-                    .add_modifier(Modifier::BOLD),
-            )
-            .alignment(Alignment::Center)
-            .block(Block::default().borders(Borders::LEFT)),
+        Paragraph::new(match app.mode {
+            Mode::Attached => "switch\nsession",
+            Mode::Switcher => "Quit GTX\nTUI",
+        })
+        .style(
+            Style::default()
+                .fg(Color::White)
+                .bg(Color::Rgb(49, 50, 68))
+                .add_modifier(Modifier::BOLD),
+        )
+        .alignment(Alignment::Center)
+        .block(Block::default().borders(Borders::LEFT)),
         switch,
     );
     if area.height > 0 {
@@ -905,28 +917,27 @@ fn render_switcher(frame: &mut Frame, app: &mut App, area: Rect) {
                 };
                 /*
                 CDXC:GhostexTui 2026-05-25-17:20:
-                Each switcher project should expose a `+ new terminal` action
+                Each switcher project should expose a create-terminal action
                 before its sessions. It creates a terminal in that project/group
                 through the existing Ghostex CLI create-session bridge so the
                 macOS app remains the owner of project placement and zmx setup.
+
+                CDXC:GhostexTui 2026-05-25-17:48:
+                The create-terminal row should read "Create new terminal" in a
+                lighter color and without a leading plus, so it feels like a
+                quiet project action rather than another agent/session row.
                 */
-                ListItem::new(Line::from(vec![
-                    Span::styled(
-                        "  + ",
-                        Style::default().fg(Color::Rgb(115, 231, 156)).bg(bg),
-                    ),
-                    Span::styled(
-                        "new terminal",
-                        Style::default()
-                            .fg(Color::White)
-                            .bg(bg)
-                            .add_modifier(if selected {
-                                Modifier::BOLD
-                            } else {
-                                Modifier::empty()
-                            }),
-                    ),
-                ]))
+                ListItem::new(Line::from(Span::styled(
+                    "  Create new terminal",
+                    Style::default()
+                        .fg(Color::Rgb(205, 214, 244))
+                        .bg(bg)
+                        .add_modifier(if selected {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
+                )))
                 .style(Style::default().bg(bg))
             }
             SwitchRow::Session(session) => {
@@ -1008,7 +1019,7 @@ fn handle_key(app: &mut App, key: KeyEvent, terminal_rect: Rect) -> bool {
     false
 }
 
-fn handle_mouse(app: &mut App, mouse: MouseEvent, full: Rect, terminal_rect: Rect) {
+fn handle_mouse(app: &mut App, mouse: MouseEvent, full: Rect, terminal_rect: Rect) -> bool {
     match app.mode {
         Mode::Attached => {
             if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
@@ -1032,11 +1043,20 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, full: Rect, terminal_rect: Rec
             }
         }
         Mode::Switcher => match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left)
+                if rect_contains(
+                    switch_button_rect(header_area(full)),
+                    mouse.column,
+                    mouse.row,
+                ) =>
+            {
+                return true;
+            }
             MouseEventKind::ScrollUp => app.select_delta(-(MOUSE_SCROLL_LINES as isize)),
             MouseEventKind::ScrollDown => app.select_delta(MOUSE_SCROLL_LINES as isize),
             MouseEventKind::Down(MouseButton::Left) => {
                 if mouse.row < terminal_rect.y {
-                    return;
+                    return false;
                 }
                 let doc_y = app
                     .switch_scroll
@@ -1048,6 +1068,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, full: Rect, terminal_rect: Rec
             _ => {}
         },
     }
+    false
 }
 
 fn handle_switch_action(app: &mut App, terminal_rect: Rect) {
