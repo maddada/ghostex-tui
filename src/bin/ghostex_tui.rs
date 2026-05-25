@@ -776,7 +776,7 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
     /*
     CDXC:GhostexTui 2026-05-25-17:24:
     The attached TUI needs visible chrome separation from the terminal pane.
-    Render the top bar on a full-width background with a bottom rule so phone
+    Render the top bar on a full-width background with a boundary rule so phone
     and desktop users can distinguish Ghostex controls from session output.
 
     CDXC:GhostexTui 2026-05-25-17:38:
@@ -793,6 +793,11 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
     The switcher quit label should keep "Quit" on the first row and "GTX TUI"
     on the second row, while attached activity counters reserve one trailing
     space before the switch button so the attention count does not touch it.
+
+    CDXC:GhostexTui 2026-05-25-18:37:
+    The TUI title bar sits at the bottom of the screen, so its separator must
+    render on the top edge instead of below the bar to divide session output
+    from Ghostex controls.
     */
     let header_style = Style::default().bg(Color::Rgb(24, 24, 37));
     frame.render_widget(Clear, area);
@@ -861,7 +866,7 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
             .wrap(Wrap { trim: false }),
         Rect::new(
             status.x,
-            status.y,
+            status.y + 1,
             title_width,
             area.height.saturating_sub(1),
         ),
@@ -879,17 +884,16 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
         )
         .alignment(Alignment::Center)
         .block(Block::default().borders(Borders::LEFT)),
-        switch,
+        Rect::new(switch.x, switch.y + 1, switch.width, switch.height),
     );
     if area.height > 0 {
-        let border_y = area.y + area.height.saturating_sub(1);
         frame.render_widget(
             Paragraph::new("─".repeat(area.width as usize)).style(
                 Style::default()
                     .fg(Color::Rgb(69, 71, 90))
                     .bg(Color::Rgb(24, 24, 37)),
             ),
-            Rect::new(area.x, border_y, area.width, 1),
+            Rect::new(area.x, area.y, area.width, 1),
         );
     }
 }
