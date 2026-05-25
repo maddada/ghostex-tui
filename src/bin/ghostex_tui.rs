@@ -279,6 +279,48 @@ impl App {
         self.selected_row_index = self.row_index_for_session_index(next);
     }
 
+    fn select_project_delta(&mut self, delta: isize) {
+        /*
+        CDXC:GhostexTui 2026-05-25-16:05:
+        In the session switcher, left/right should move between projects by
+        selecting each project's first session. Keep wrapping behavior so phone
+        and keyboard users can cycle through project sections without landing
+        on non-selectable headers.
+        */
+        let starts = self.project_session_starts();
+        if starts.is_empty() {
+            return;
+        }
+        let current_project = starts
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(idx, start)| {
+                if *start <= self.selected_session_index {
+                    Some(idx)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+        let next_project = wrap_index(current_project as isize + delta, starts.len());
+        self.selected_session_index = starts[next_project];
+        self.selected_row_index = self.row_index_for_session_index(self.selected_session_index);
+    }
+
+    fn project_session_starts(&self) -> Vec<usize> {
+        let mut starts = Vec::new();
+        let mut next_session_index = 0usize;
+        for group in &self.groups {
+            if group.sessions.is_empty() {
+                continue;
+            }
+            starts.push(next_session_index);
+            next_session_index += group.sessions.len();
+        }
+        starts
+    }
+
     fn select_row_at_document_y(&mut self, doc_y: usize) -> Option<SessionItem> {
         let row = self.rows.get(doc_y)?.clone();
         let SwitchRow::Session(session) = row else {
@@ -584,6 +626,8 @@ fn handle_key(app: &mut App, key: KeyEvent, terminal_rect: Rect) -> bool {
             KeyCode::Esc if app.active_session.is_some() => app.mode = Mode::Attached,
             KeyCode::Up => app.select_delta(-1),
             KeyCode::Down => app.select_delta(1),
+            KeyCode::Left => app.select_project_delta(-1),
+            KeyCode::Right => app.select_project_delta(1),
             KeyCode::PageUp => app.select_delta(-5),
             KeyCode::PageDown => app.select_delta(5),
             KeyCode::Enter | KeyCode::Char(' ') => {
@@ -829,6 +873,70 @@ fn encode_key(key: KeyEvent) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_session(project_id: &str, title: &str) -> SessionItem {
+        SessionItem {
+            agent: Some("codex".to_string()),
+            project_id: Some(project_id.to_string()),
+            project_name: Some(project_id.to_string()),
+            project_path: Some(format!("/{project_id}")),
+            session_id: format!("{project_id}-{title}"),
+            title: title.to_string(),
+        }
+    }
+
+    fn test_app(groups: Vec<ProjectGroup>) -> App {
+        let rows = switch_rows(&groups);
+        App {
+            groups,
+            rows,
+            selected_session_index: 0,
+            selected_row_index: 1,
+            active_session: None,
+            pty: None,
+            mode: Mode::Switcher,
+            switch_scroll: 0,
+            last_refresh: Instant::now(),
+            status: String::new(),
+        }
+    }
+
+    #[test]
+    fn switcher_left_right_jump_to_project_first_sessions() {
+        let mut app = test_app(vec![
+            ProjectGroup {
+                name: "alpha".to_string(),
+                sessions: vec![test_session("alpha", "one"), test_session("alpha", "two")],
+            },
+            ProjectGroup {
+                name: "beta".to_string(),
+                sessions: vec![test_session("beta", "one"), test_session("beta", "two")],
+            },
+            ProjectGroup {
+                name: "gamma".to_string(),
+                sessions: vec![test_session("gamma", "one")],
+            },
+        ]);
+
+        app.select_delta(1);
+        assert_eq!(app.selected_session_index, 1);
+
+        app.select_project_delta(1);
+        assert_eq!(app.selected_session_index, 2);
+        assert_eq!(app.selected_row_index, 4);
+
+        app.select_project_delta(1);
+        assert_eq!(app.selected_session_index, 4);
+        assert_eq!(app.selected_row_index, 7);
+
+        app.select_project_delta(1);
+        assert_eq!(app.selected_session_index, 0);
+        assert_eq!(app.selected_row_index, 1);
+
+        app.select_project_delta(-1);
+        assert_eq!(app.selected_session_index, 4);
+        assert_eq!(app.selected_row_index, 7);
+    }
 
     #[test]
     fn terminal_row_preserves_ansi_colors_and_modes() {
