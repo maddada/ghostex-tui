@@ -15,10 +15,10 @@ use crossterm::terminal::{
 };
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use serde::Deserialize;
 
@@ -621,21 +621,15 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
     The attached TUI needs visible chrome separation from the terminal pane.
     Render the top bar on a full-width background with a bottom rule so phone
     and desktop users can distinguish Ghostex controls from session output.
+
+    CDXC:GhostexTui 2026-05-25-17:38:
+    The header title may wrap onto the second content row while activity counts
+    stay below it on the right. Keep the switch affordance two rows tall and
+    label it as "switch session" with one word per row.
     */
     let header_style = Style::default().bg(Color::Rgb(24, 24, 37));
     frame.render_widget(Clear, area);
     frame.render_widget(Paragraph::new("").style(header_style), area);
-    if area.height > 0 {
-        let border_y = area.y + area.height.saturating_sub(1);
-        frame.render_widget(
-            Paragraph::new("─".repeat(area.width as usize)).style(
-                Style::default()
-                    .fg(Color::Rgb(69, 71, 90))
-                    .bg(Color::Rgb(24, 24, 37)),
-            ),
-            Rect::new(area.x, border_y, area.width, 1),
-        );
-    }
     let switch_width = 12u16.min(area.width);
     let status_width = area.width.saturating_sub(switch_width);
     let status = Rect::new(area.x, area.y, status_width, area.height);
@@ -645,12 +639,19 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
         .as_ref()
         .map(|session| session.title.as_str())
         .unwrap_or("No session");
-    let project = app
-        .active_session
-        .as_ref()
-        .map(project_label)
-        .unwrap_or_else(|| "Ghostex".to_string());
-    let mut title_spans = vec![
+    let count_width = if app.mode == Mode::Attached {
+        activity_count_width(
+            app.activity_count(SessionActivity::Working),
+            app.activity_count(SessionActivity::Attention),
+        )
+        .min(status_width)
+    } else {
+        0
+    };
+    let title_width = status_width
+        .saturating_sub(count_width)
+        .max(status_width.min(1));
+    let title_spans = vec![
         Span::styled(
             " Ghostex ",
             Style::default()
@@ -671,28 +672,42 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
         the literal words "working" or "attention"; the dot colors carry the
         same meaning as the macOS sidebar indicators.
         */
-        title_spans.extend(activity_count_spans(
+        let counts = activity_count_spans(
             app.activity_count(SessionActivity::Working),
             app.activity_count(SessionActivity::Attention),
-        ));
+        );
+        frame.render_widget(
+            Paragraph::new(Line::from(counts))
+                .style(header_style)
+                .alignment(Alignment::Right),
+            Rect::new(
+                status.x + status_width.saturating_sub(count_width),
+                status.y + 1,
+                count_width,
+                1,
+            ),
+        );
     }
     frame.render_widget(
-        Paragraph::new(Line::from(title_spans)).style(header_style),
-        Rect::new(status.x, status.y, status.width, 1),
+        Paragraph::new(Line::from(title_spans))
+            .style(header_style)
+            .wrap(Wrap { trim: false }),
+        Rect::new(
+            status.x,
+            status.y,
+            title_width,
+            area.height.saturating_sub(1),
+        ),
     );
     frame.render_widget(
-        Paragraph::new(format!(" {project}")).style(header_style.fg(Color::DarkGray)),
-        Rect::new(status.x, status.y + 1, status.width, 1),
-    );
-    frame.render_widget(
-        Paragraph::new("switch")
+        Paragraph::new("switch\nsession")
             .style(
                 Style::default()
                     .fg(Color::White)
                     .bg(Color::Rgb(49, 50, 68))
                     .add_modifier(Modifier::BOLD),
             )
-            .alignment(ratatui::layout::Alignment::Center)
+            .alignment(Alignment::Center)
             .block(Block::default().borders(Borders::LEFT)),
         switch,
     );
@@ -810,7 +825,6 @@ fn activity_dot_span(session: &SessionItem, bg: Color) -> Span<'static> {
 
 fn activity_count_spans(working_count: usize, attention_count: usize) -> Vec<Span<'static>> {
     vec![
-        Span::raw("   "),
         Span::styled("●", Style::default().fg(WORKING_COLOR)),
         Span::styled(
             format!(" {working_count}"),
@@ -823,6 +837,12 @@ fn activity_count_spans(working_count: usize, attention_count: usize) -> Vec<Spa
             Style::default().fg(Color::White),
         ),
     ]
+}
+
+fn activity_count_width(working_count: usize, attention_count: usize) -> u16 {
+    format!("● {working_count}  ● {attention_count}")
+        .chars()
+        .count() as u16
 }
 
 fn activity_color(activity: SessionActivity) -> Color {
@@ -1179,7 +1199,7 @@ fn switch_button_rect(header: Rect) -> Rect {
         header.x + header.width.saturating_sub(width),
         header.y,
         width,
-        header.height,
+        header.height.min(2),
     )
 }
 
