@@ -24,6 +24,8 @@ use serde::Deserialize;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(16);
 const SESSION_LIST_REFRESH: Duration = Duration::from_secs(3);
+const GHOSTEX_TUI_TERM: &str = "xterm-256color";
+const GHOSTEX_TUI_COLORTERM: &str = "truecolor";
 
 #[derive(Debug, Deserialize, Clone)]
 struct SessionItem {
@@ -92,6 +94,16 @@ impl PtySession {
         let mut command = CommandBuilder::new("/bin/zsh");
         command.arg("-lc");
         command.arg(shell_command);
+        /*
+        CDXC:GhostexTui 2026-05-25-15:50:
+        The attached session PTY is rendered by Ghostex TUI, not by the outer
+        shell that launched `gtx`. Force a real terminal identity so Codex CLI,
+        Starship, and other terminal-aware tools do not inherit TERM=dumb from
+        desktop launchers or non-terminal hosts.
+        */
+        command.env("TERM", GHOSTEX_TUI_TERM);
+        command.env("COLORTERM", GHOSTEX_TUI_COLORTERM);
+        command.env("TERM_PROGRAM", "ghostex-tui");
         let child = pair.slave.spawn_command(command).map_err(io_other)?;
         drop(pair.slave);
         let mut reader = pair.master.try_clone_reader().map_err(io_other)?;
