@@ -751,12 +751,19 @@ fn main() -> io::Result<()> {
 
 fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
-    let chunks = Layout::vertical([Constraint::Length(3), Constraint::Min(1)]).split(area);
-    render_header(frame, app, chunks[0]);
+    /*
+    CDXC:GhostexTui 2026-05-25-18:17:
+    The Ghostex TUI control bar belongs at the bottom of the screen, leaving
+    terminal output and the switcher above it. Keep all hit-testing on the
+    shared header_area/terminal_area helpers so mouse behavior follows the
+    rendered layout.
+    */
+    let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(3)]).split(area);
     match app.mode {
-        Mode::Attached => render_terminal(frame, app, chunks[1]),
-        Mode::Switcher => render_switcher(frame, app, chunks[1]),
+        Mode::Attached => render_terminal(frame, app, chunks[0]),
+        Mode::Switcher => render_switcher(frame, app, chunks[0]),
     }
+    render_header(frame, app, chunks[1]);
     if let Some(menu) = app.context_menu.as_ref() {
         render_context_menu(frame, menu, area);
     }
@@ -1359,7 +1366,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, full: Rect, terminal_rect: Rec
             MouseEventKind::ScrollUp => app.select_delta(-(MOUSE_SCROLL_LINES as isize)),
             MouseEventKind::ScrollDown => app.select_delta(MOUSE_SCROLL_LINES as isize),
             MouseEventKind::Down(MouseButton::Left) => {
-                if mouse.row < terminal_rect.y {
+                if !rect_contains(terminal_rect, mouse.column, mouse.row) {
                     return false;
                 }
                 let doc_y = app
@@ -1865,14 +1872,20 @@ fn shell_quote(value: &str) -> String {
 }
 
 fn header_area(full: Rect) -> Rect {
-    Rect::new(full.x, full.y, full.width, full.height.min(3))
+    let height = full.height.min(3);
+    Rect::new(
+        full.x,
+        full.y + full.height.saturating_sub(height),
+        full.width,
+        height,
+    )
 }
 
 fn terminal_area(full: Rect) -> Rect {
     let header = header_area(full);
     Rect::new(
         full.x,
-        full.y + header.height,
+        full.y,
         full.width,
         full.height.saturating_sub(header.height),
     )
