@@ -47,6 +47,10 @@ struct SessionItem {
     project_id: Option<String>,
     #[serde(default, rename = "groupId")]
     group_id: Option<String>,
+    #[serde(default, rename = "attachCommand")]
+    attach_command: Option<String>,
+    #[serde(default, rename = "isFavorite")]
+    is_favorite: Option<bool>,
     #[serde(default, rename = "projectName")]
     project_name: Option<String>,
     #[serde(default, rename = "projectPath")]
@@ -55,6 +59,10 @@ struct SessionItem {
     session_id: String,
     #[serde(default)]
     status: String,
+    #[serde(default)]
+    resume_command: Option<String>,
+    #[serde(default, rename = "resumeFallbackCommand")]
+    resume_fallback_command: Option<String>,
     #[serde(default)]
     title: String,
 }
@@ -84,17 +92,26 @@ struct ProjectGroup {
     project_id: Option<String>,
     group_id: Option<String>,
     name: String,
+    path: Option<String>,
     sessions: Vec<SessionItem>,
 }
 
 #[derive(Debug, Clone)]
 enum SwitchRow {
-    Project(String),
+    Project(ProjectHeader),
     NewTerminal {
         project_id: Option<String>,
         group_id: Option<String>,
     },
     Session(SessionItem),
+}
+
+#[derive(Debug, Clone)]
+struct ProjectHeader {
+    project_id: Option<String>,
+    group_id: Option<String>,
+    name: String,
+    path: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,6 +127,68 @@ enum SwitchAction {
         project_id: Option<String>,
         group_id: Option<String>,
     },
+}
+
+#[derive(Debug, Clone)]
+struct ContextMenu {
+    title: String,
+    actions: Vec<ContextAction>,
+    selected_index: usize,
+}
+
+#[derive(Debug, Clone)]
+struct ContextAction {
+    danger: bool,
+    label: String,
+    kind: ContextActionKind,
+}
+
+#[derive(Debug, Clone)]
+enum ContextActionKind {
+    CopyAttachCommand(SessionItem),
+    CopyProjectPath(ProjectHeader),
+    CopyResumeCommand(SessionItem),
+    CreateTerminal {
+        project_id: Option<String>,
+        group_id: Option<String>,
+    },
+    FocusGroup(ProjectHeader),
+    OpenProjectInFinder(ProjectHeader),
+    ProjectCloseSessions(ProjectHeader),
+    ProjectFullReload(ProjectHeader),
+    ProjectMove {
+        project_id: Option<String>,
+        direction: &'static str,
+    },
+    ProjectSleep {
+        header: ProjectHeader,
+        sleeping: bool,
+    },
+    RenameSession(SessionItem),
+    SessionAttach(SessionItem),
+    SessionClose(SessionItem),
+    SessionFavorite {
+        session: SessionItem,
+        favorite: bool,
+    },
+    SessionFork(SessionItem),
+    SessionFullReload(SessionItem),
+    SessionSleep {
+        session: SessionItem,
+        sleeping: bool,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct InputPrompt {
+    title: String,
+    value: String,
+    action: InputPromptAction,
+}
+
+#[derive(Debug, Clone)]
+enum InputPromptAction {
+    RenameSession(SessionItem),
 }
 
 struct PtySession {
@@ -268,6 +347,8 @@ struct App {
     selected_session_index: usize,
     selected_row_index: usize,
     active_session: Option<SessionItem>,
+    context_menu: Option<ContextMenu>,
+    input_prompt: Option<InputPrompt>,
     pty: Option<PtySession>,
     mode: Mode,
     switch_scroll: usize,
@@ -285,6 +366,8 @@ impl App {
             selected_session_index: 0,
             selected_row_index: 0,
             active_session: None,
+            context_menu: None,
+            input_prompt: None,
             pty: None,
             mode: Mode::Switcher,
             switch_scroll: 0,
@@ -431,8 +514,9 @@ impl App {
             .iter()
             .enumerate()
             .filter_map(|(idx, row)| match row {
-                SwitchRow::Project(_) => None,
-                SwitchRow::NewTerminal { .. } | SwitchRow::Session(_) => Some(idx),
+                SwitchRow::Project(_) | SwitchRow::NewTerminal { .. } | SwitchRow::Session(_) => {
+                    Some(idx)
+                }
             })
             .collect()
     }
@@ -528,13 +612,60 @@ impl App {
     }
 
     fn select_row_at_document_y(&mut self, doc_y: usize) -> Option<SwitchAction> {
-        let row = self.rows.get(doc_y)?.clone();
-        if matches!(row, SwitchRow::Project(_)) {
-            return None;
-        }
+        self.rows.get(doc_y)?;
         self.selected_row_index = doc_y;
         self.sync_selected_session_index_from_row();
         self.selected_action()
+    }
+
+    fn open_context_menu(&mut self) {
+        /*
+        CDXC:GhostexTui 2026-05-25-18:08:
+        Ctrl+K opens one keyboard-driven context menu for both session rows and
+        project headers. The menu mirrors the macOS sidebar right-click actions
+        that are executable from the CLI/TUI context, with project group actions
+        applied to the same grouped sessions visible under that header.
+        */
+        let Some(row) = self.rows.get(self.selected_row_index).cloned() else {
+            return;
+        };
+        self.context_menu = match row {
+            SwitchRow::Project(header) => Some(ContextMenu {
+                title: header.name.clone(),
+                actions: project_context_actions(&header, self.project_sessions(&header)),
+                selected_index: 0,
+            }),
+            SwitchRow::Session(session) => Some(ContextMenu {
+                title: session.title.clone(),
+                actions: session_context_actions(&session),
+                selected_index: 0,
+            }),
+            SwitchRow::NewTerminal {
+                project_id,
+                group_id,
+            } => Some(ContextMenu {
+                title: "Create new terminal".to_string(),
+                actions: vec![ContextAction {
+                    danger: false,
+                    label: "Create new terminal".to_string(),
+                    kind: ContextActionKind::CreateTerminal {
+                        project_id,
+                        group_id,
+                    },
+                }],
+                selected_index: 0,
+            }),
+        };
+    }
+
+    fn project_sessions(&self, header: &ProjectHeader) -> Vec<SessionItem> {
+        self.groups
+            .iter()
+            .find(|group| {
+                group.group_id == header.group_id && group.project_id == header.project_id
+            })
+            .map(|group| group.sessions.clone())
+            .unwrap_or_default()
     }
 
     fn switcher_max_scroll(&self, viewport: Rect) -> usize {
@@ -616,6 +747,12 @@ fn render(frame: &mut Frame, app: &mut App) {
     match app.mode {
         Mode::Attached => render_terminal(frame, app, chunks[1]),
         Mode::Switcher => render_switcher(frame, app, chunks[1]),
+    }
+    if let Some(menu) = app.context_menu.as_ref() {
+        render_context_menu(frame, menu, area);
+    }
+    if let Some(prompt) = app.input_prompt.as_ref() {
+        render_input_prompt(frame, prompt, area);
     }
 }
 
@@ -902,12 +1039,22 @@ fn render_switcher(frame: &mut Frame, app: &mut App, area: Rect) {
         .skip(app.switch_scroll)
         .take(area.height as usize)
         .map(|(idx, row)| match row {
-            SwitchRow::Project(project) => ListItem::new(Line::from(Span::styled(
-                project.clone(),
-                Style::default()
-                    .fg(Color::Rgb(137, 180, 250))
-                    .add_modifier(Modifier::BOLD),
-            ))),
+            SwitchRow::Project(project) => {
+                let selected = idx == app.selected_row_index;
+                let bg = if selected {
+                    Color::Rgb(49, 50, 68)
+                } else {
+                    Color::Reset
+                };
+                ListItem::new(Line::from(Span::styled(
+                    project.name.clone(),
+                    Style::default()
+                        .fg(Color::Rgb(137, 180, 250))
+                        .bg(bg)
+                        .add_modifier(Modifier::BOLD),
+                )))
+                .style(Style::default().bg(bg))
+            }
             SwitchRow::NewTerminal { .. } => {
                 let selected = idx == app.selected_row_index;
                 let bg = if selected {
@@ -985,9 +1132,94 @@ fn render_switcher(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_stateful_widget(list, area, &mut state);
 }
 
+fn render_context_menu(frame: &mut Frame, menu: &ContextMenu, full: Rect) {
+    let width = full.width.min(44).max(24);
+    let height = (menu.actions.len() as u16 + 2).min(full.height.saturating_sub(2).max(3));
+    let area = centered_rect(width, height, full);
+    frame.render_widget(Clear, area);
+    let visible_actions = menu
+        .actions
+        .iter()
+        .enumerate()
+        .map(|(idx, action)| {
+            let selected = idx == menu.selected_index;
+            let bg = if selected {
+                Color::Rgb(49, 50, 68)
+            } else {
+                Color::Rgb(24, 24, 37)
+            };
+            let fg = if action.danger {
+                Color::Rgb(255, 121, 121)
+            } else {
+                Color::White
+            };
+            ListItem::new(Line::from(Span::styled(
+                action.label.clone(),
+                Style::default().fg(fg).bg(bg).add_modifier(if selected {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
+            )))
+            .style(Style::default().bg(bg))
+        })
+        .collect::<Vec<_>>();
+    let mut state = ListState::default();
+    state.select(Some(menu.selected_index));
+    frame.render_stateful_widget(
+        List::new(visible_actions)
+            .block(
+                Block::default()
+                    .title(format!(" {} ", menu.title))
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Rgb(137, 180, 250)))
+                    .style(Style::default().bg(Color::Rgb(24, 24, 37))),
+            )
+            .highlight_symbol(" "),
+        area,
+        &mut state,
+    );
+}
+
+fn render_input_prompt(frame: &mut Frame, prompt: &InputPrompt, full: Rect) {
+    let width = full.width.min(60).max(28);
+    let area = centered_rect(width, 5, full);
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(format!("{}\n\n{}", prompt.title, prompt.value))
+            .style(Style::default().fg(Color::White).bg(Color::Rgb(24, 24, 37)))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Rgb(137, 180, 250))),
+            ),
+        area,
+    );
+}
+
 fn handle_key(app: &mut App, key: KeyEvent, terminal_rect: Rect) -> bool {
+    if app.input_prompt.is_some() {
+        return handle_input_prompt_key(app, key);
+    }
+    if app.context_menu.is_some() {
+        return handle_context_menu_key(app, key, terminal_rect);
+    }
     if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('q')) {
         return true;
+    }
+    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('k')) {
+        if app.mode == Mode::Attached {
+            if let Some(session) = app.active_session.clone() {
+                app.context_menu = Some(ContextMenu {
+                    title: session.title.clone(),
+                    actions: session_context_actions(&session),
+                    selected_index: 0,
+                });
+            }
+        } else {
+            app.open_context_menu();
+        }
+        return false;
     }
     match app.mode {
         Mode::Switcher => match key.code {
@@ -1015,6 +1247,59 @@ fn handle_key(app: &mut App, key: KeyEvent, terminal_rect: Rect) -> bool {
                 }
             }
         }
+    }
+    false
+}
+
+fn handle_context_menu_key(app: &mut App, key: KeyEvent, terminal_rect: Rect) -> bool {
+    let Some(menu) = app.context_menu.as_mut() else {
+        return false;
+    };
+    match key.code {
+        KeyCode::Esc => app.context_menu = None,
+        KeyCode::Up => {
+            if !menu.actions.is_empty() {
+                menu.selected_index =
+                    wrap_index(menu.selected_index as isize - 1, menu.actions.len());
+            }
+        }
+        KeyCode::Down => {
+            if !menu.actions.is_empty() {
+                menu.selected_index =
+                    wrap_index(menu.selected_index as isize + 1, menu.actions.len());
+            }
+        }
+        KeyCode::Enter | KeyCode::Char(' ') => {
+            let action = menu.actions.get(menu.selected_index).cloned();
+            app.context_menu = None;
+            if let Some(action) = action {
+                execute_context_action(app, action, terminal_rect);
+            }
+        }
+        _ => {}
+    }
+    false
+}
+
+fn handle_input_prompt_key(app: &mut App, key: KeyEvent) -> bool {
+    let Some(prompt) = app.input_prompt.as_mut() else {
+        return false;
+    };
+    match key.code {
+        KeyCode::Esc => app.input_prompt = None,
+        KeyCode::Enter => {
+            let prompt = app.input_prompt.take();
+            if let Some(prompt) = prompt {
+                execute_input_prompt(app, prompt);
+            }
+        }
+        KeyCode::Backspace => {
+            prompt.value.pop();
+        }
+        KeyCode::Char(ch) if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT => {
+            prompt.value.push(ch);
+        }
+        _ => {}
     }
     false
 }
@@ -1099,6 +1384,291 @@ fn handle_switch_action(app: &mut App, terminal_rect: Rect) {
     }
 }
 
+fn session_context_actions(session: &SessionItem) -> Vec<ContextAction> {
+    let favorite = !session.is_favorite.unwrap_or(false);
+    let sleeping = session.status != "sleep";
+    let mut actions = vec![
+        ContextAction {
+            danger: false,
+            label: "Attach".to_string(),
+            kind: ContextActionKind::SessionAttach(session.clone()),
+        },
+        ContextAction {
+            danger: false,
+            label: "Rename".to_string(),
+            kind: ContextActionKind::RenameSession(session.clone()),
+        },
+        ContextAction {
+            danger: false,
+            label: if favorite { "Favorite" } else { "Unfavorite" }.to_string(),
+            kind: ContextActionKind::SessionFavorite {
+                session: session.clone(),
+                favorite,
+            },
+        },
+        ContextAction {
+            danger: false,
+            label: if sleeping { "Sleep" } else { "Wake" }.to_string(),
+            kind: ContextActionKind::SessionSleep {
+                session: session.clone(),
+                sleeping,
+            },
+        },
+    ];
+    if session
+        .resume_command
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+        || session
+            .resume_fallback_command
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+    {
+        actions.push(ContextAction {
+            danger: false,
+            label: "Copy resume".to_string(),
+            kind: ContextActionKind::CopyResumeCommand(session.clone()),
+        });
+    }
+    if session
+        .attach_command
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        actions.push(ContextAction {
+            danger: false,
+            label: "Copy attach command".to_string(),
+            kind: ContextActionKind::CopyAttachCommand(session.clone()),
+        });
+    }
+    actions.extend([
+        ContextAction {
+            danger: false,
+            label: "Fork".to_string(),
+            kind: ContextActionKind::SessionFork(session.clone()),
+        },
+        ContextAction {
+            danger: false,
+            label: "Full reload".to_string(),
+            kind: ContextActionKind::SessionFullReload(session.clone()),
+        },
+        ContextAction {
+            danger: true,
+            label: "Close".to_string(),
+            kind: ContextActionKind::SessionClose(session.clone()),
+        },
+    ]);
+    actions
+}
+
+fn project_context_actions(
+    header: &ProjectHeader,
+    sessions: Vec<SessionItem>,
+) -> Vec<ContextAction> {
+    let all_sleeping =
+        !sessions.is_empty() && sessions.iter().all(|session| session.status == "sleep");
+    let mut actions = vec![
+        ContextAction {
+            danger: false,
+            label: "Create new terminal".to_string(),
+            kind: ContextActionKind::CreateTerminal {
+                project_id: header.project_id.clone(),
+                group_id: header.group_id.clone(),
+            },
+        },
+        ContextAction {
+            danger: false,
+            label: "Focus".to_string(),
+            kind: ContextActionKind::FocusGroup(header.clone()),
+        },
+    ];
+    if header
+        .path
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        actions.extend([
+            ContextAction {
+                danger: false,
+                label: "Copy Path".to_string(),
+                kind: ContextActionKind::CopyProjectPath(header.clone()),
+            },
+            ContextAction {
+                danger: false,
+                label: "Open in Finder".to_string(),
+                kind: ContextActionKind::OpenProjectInFinder(header.clone()),
+            },
+        ]);
+    }
+    actions.extend([
+        ContextAction {
+            danger: false,
+            label: if all_sleeping { "Wake" } else { "Sleep" }.to_string(),
+            kind: ContextActionKind::ProjectSleep {
+                header: header.clone(),
+                sleeping: !all_sleeping,
+            },
+        },
+        ContextAction {
+            danger: false,
+            label: "Full reload".to_string(),
+            kind: ContextActionKind::ProjectFullReload(header.clone()),
+        },
+    ]);
+    if header.project_id.is_some() {
+        actions.extend([
+            ContextAction {
+                danger: false,
+                label: "Move Project Up".to_string(),
+                kind: ContextActionKind::ProjectMove {
+                    project_id: header.project_id.clone(),
+                    direction: "up",
+                },
+            },
+            ContextAction {
+                danger: false,
+                label: "Move Project Down".to_string(),
+                kind: ContextActionKind::ProjectMove {
+                    project_id: header.project_id.clone(),
+                    direction: "down",
+                },
+            },
+        ]);
+    }
+    actions.push(ContextAction {
+        danger: true,
+        label: "Close Sessions".to_string(),
+        kind: ContextActionKind::ProjectCloseSessions(header.clone()),
+    });
+    actions
+}
+
+fn execute_context_action(app: &mut App, action: ContextAction, terminal_rect: Rect) {
+    let result = match action.kind {
+        ContextActionKind::SessionAttach(session) => {
+            app.attach(session, terminal_rect);
+            Ok(())
+        }
+        ContextActionKind::RenameSession(session) => {
+            app.input_prompt = Some(InputPrompt {
+                title: "Rename session".to_string(),
+                value: session.title.clone(),
+                action: InputPromptAction::RenameSession(session),
+            });
+            Ok(())
+        }
+        ContextActionKind::SessionFavorite { session, favorite } => run_ghostex_cli(&[
+            "favorite-session".to_string(),
+            "--session-id".to_string(),
+            session.session_id,
+            favorite.to_string(),
+        ])
+        .map(|_| ()),
+        ContextActionKind::SessionSleep { session, sleeping } => run_ghostex_cli(&[
+            "sleep-session".to_string(),
+            "--session-id".to_string(),
+            session.session_id,
+            sleeping.to_string(),
+        ])
+        .map(|_| ()),
+        ContextActionKind::CopyResumeCommand(session) => copy_text(
+            session
+                .resume_command
+                .or(session.resume_fallback_command)
+                .unwrap_or_default()
+                .as_str(),
+        ),
+        ContextActionKind::CopyAttachCommand(session) => {
+            copy_text(session.attach_command.unwrap_or_default().as_str())
+        }
+        ContextActionKind::SessionFork(session) => run_session_command("fork-session", &session),
+        ContextActionKind::SessionFullReload(session) => {
+            run_session_command("reload-session", &session)
+        }
+        ContextActionKind::SessionClose(session) => run_session_command("close-session", &session),
+        ContextActionKind::CreateTerminal {
+            project_id,
+            group_id,
+        } => create_terminal(project_id.as_deref(), group_id.as_deref()).map(|_| ()),
+        ContextActionKind::FocusGroup(header) => {
+            if let Some(group_id) = header.group_id {
+                run_ghostex_cli(&["focus-group".to_string(), group_id]).map(|_| ())
+            } else if let Some(project_id) = header.project_id {
+                run_ghostex_cli(&[
+                    "switch-project".to_string(),
+                    "--project-id".to_string(),
+                    project_id,
+                ])
+                .map(|_| ())
+            } else {
+                Ok(())
+            }
+        }
+        ContextActionKind::CopyProjectPath(header) => {
+            copy_text(header.path.unwrap_or_default().as_str())
+        }
+        ContextActionKind::OpenProjectInFinder(header) => {
+            open_in_finder(header.path.unwrap_or_default().as_str())
+        }
+        ContextActionKind::ProjectSleep { header, sleeping } => {
+            let sessions = app.project_sessions(&header);
+            run_project_session_command(&sessions, "sleep-session", Some(sleeping))
+        }
+        ContextActionKind::ProjectFullReload(header) => {
+            let sessions = app.project_sessions(&header);
+            run_project_session_command(&sessions, "reload-session", None)
+        }
+        ContextActionKind::ProjectCloseSessions(header) => {
+            let sessions = app.project_sessions(&header);
+            run_project_session_command(&sessions, "close-session", None)
+        }
+        ContextActionKind::ProjectMove {
+            project_id,
+            direction,
+        } => {
+            if let Some(project_id) = project_id {
+                run_ghostex_cli(&[
+                    "move-project".to_string(),
+                    "--project-id".to_string(),
+                    project_id,
+                    "--direction".to_string(),
+                    direction.to_string(),
+                ])
+                .map(|_| ())
+            } else {
+                Ok(())
+            }
+        }
+    };
+    match result {
+        Ok(()) => {
+            app.status.clear();
+            app.refresh_sessions(false);
+        }
+        Err(err) => app.status = format!("Action failed: {err}"),
+    }
+}
+
+fn execute_input_prompt(app: &mut App, prompt: InputPrompt) {
+    let result = match prompt.action {
+        InputPromptAction::RenameSession(session) => run_ghostex_cli(&[
+            "rename-session".to_string(),
+            "--session-id".to_string(),
+            session.session_id,
+            "--title".to_string(),
+            prompt.value,
+        ])
+        .map(|_| ()),
+    };
+    match result {
+        Ok(()) => {
+            app.status.clear();
+            app.refresh_sessions(false);
+        }
+        Err(err) => app.status = format!("Action failed: {err}"),
+    }
+}
+
 fn fetch_sessions() -> io::Result<Vec<SessionItem>> {
     let output = Command::new("/bin/zsh")
         .arg("-lc")
@@ -1119,14 +1689,74 @@ fn create_terminal(
     project_id: Option<&str>,
     group_id: Option<&str>,
 ) -> io::Result<CreateSessionResult> {
-    let mut command = format!("{} create-session", ghostex_cli_command());
+    let mut args = vec!["create-session".to_string()];
     if let Some(project_id) = project_id.filter(|value| !value.trim().is_empty()) {
-        command.push_str(" --project-id ");
-        command.push_str(&shell_quote(project_id));
+        args.extend(["--project-id".to_string(), project_id.to_string()]);
     }
     if let Some(group_id) = group_id.filter(|value| !value.trim().is_empty()) {
-        command.push_str(" --group-id ");
-        command.push_str(&shell_quote(group_id));
+        args.extend(["--group-id".to_string(), group_id.to_string()]);
+    }
+    let output = run_ghostex_cli(&args)?;
+    serde_json::from_slice(&output).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+}
+
+fn run_session_command(command: &str, session: &SessionItem) -> io::Result<()> {
+    run_ghostex_cli(&[
+        command.to_string(),
+        "--session-id".to_string(),
+        session.session_id.clone(),
+    ])
+    .map(|_| ())
+}
+
+fn run_project_session_command(
+    sessions: &[SessionItem],
+    command: &str,
+    boolean: Option<bool>,
+) -> io::Result<()> {
+    for session in sessions {
+        let mut args = vec![
+            command.to_string(),
+            "--session-id".to_string(),
+            session.session_id.clone(),
+        ];
+        if let Some(value) = boolean {
+            args.push(value.to_string());
+        }
+        run_ghostex_cli(&args)?;
+    }
+    Ok(())
+}
+
+fn copy_text(text: &str) -> io::Result<()> {
+    let mut child = Command::new("pbcopy")
+        .stdin(std::process::Stdio::piped())
+        .spawn()?;
+    if let Some(stdin) = child.stdin.as_mut() {
+        stdin.write_all(text.as_bytes())?;
+    }
+    let status = child.wait()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::new(io::ErrorKind::Other, "pbcopy failed"))
+    }
+}
+
+fn open_in_finder(path: &str) -> io::Result<()> {
+    let status = Command::new("open").arg(path).status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::new(io::ErrorKind::Other, "open failed"))
+    }
+}
+
+fn run_ghostex_cli(args: &[String]) -> io::Result<Vec<u8>> {
+    let mut command = ghostex_cli_command();
+    for arg in args {
+        command.push(' ');
+        command.push_str(&shell_quote(arg));
     }
     let output = Command::new("/bin/zsh").arg("-lc").arg(command).output()?;
     if !output.status.success() {
@@ -1135,8 +1765,7 @@ fn create_terminal(
             String::from_utf8_lossy(&output.stderr).trim().to_string(),
         ));
     }
-    serde_json::from_slice(&output.stdout)
-        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+    Ok(output.stdout)
 }
 
 fn io_other(error: impl std::fmt::Display) -> io::Error {
@@ -1166,6 +1795,7 @@ fn group_sessions(sessions: Vec<SessionItem>) -> Vec<ProjectGroup> {
                 } else {
                     project_label(&session)
                 },
+                path: session.project_path.clone(),
                 sessions: Vec::new(),
             });
             idx
@@ -1178,7 +1808,12 @@ fn group_sessions(sessions: Vec<SessionItem>) -> Vec<ProjectGroup> {
 fn switch_rows(groups: &[ProjectGroup]) -> Vec<SwitchRow> {
     let mut rows = Vec::new();
     for group in groups {
-        rows.push(SwitchRow::Project(group.name.clone()));
+        rows.push(SwitchRow::Project(ProjectHeader {
+            project_id: group.project_id.clone(),
+            group_id: group.group_id.clone(),
+            name: group.name.clone(),
+            path: group.path.clone(),
+        }));
         rows.push(SwitchRow::NewTerminal {
             project_id: group.project_id.clone(),
             group_id: group.group_id.clone(),
@@ -1231,6 +1866,17 @@ fn rect_contains(rect: Rect, col: u16, row: u16) -> bool {
         && col < rect.x + rect.width
         && row >= rect.y
         && row < rect.y + rect.height
+}
+
+fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    )
 }
 
 fn project_label(session: &SessionItem) -> String {
@@ -1402,8 +2048,12 @@ mod tests {
             agent: Some("codex".to_string()),
             project_id: Some(project_id.to_string()),
             group_id: Some(format!("{project_id}-group")),
+            attach_command: Some(format!("zmx attach {project_id}-{title}")),
+            is_favorite: Some(false),
             project_name: Some(project_id.to_string()),
             project_path: Some(format!("/{project_id}")),
+            resume_command: None,
+            resume_fallback_command: None,
             session_id: format!("{project_id}-{title}"),
             status: "idle".to_string(),
             title: title.to_string(),
@@ -1418,6 +2068,8 @@ mod tests {
             selected_session_index: 0,
             selected_row_index: 1,
             active_session: None,
+            context_menu: None,
+            input_prompt: None,
             pty: None,
             mode: Mode::Switcher,
             switch_scroll: 0,
@@ -1435,18 +2087,21 @@ mod tests {
                 project_id: Some("alpha".to_string()),
                 group_id: Some("alpha-group".to_string()),
                 name: "alpha".to_string(),
+                path: Some("/alpha".to_string()),
                 sessions: vec![test_session("alpha", "one"), test_session("alpha", "two")],
             },
             ProjectGroup {
                 project_id: Some("beta".to_string()),
                 group_id: Some("beta-group".to_string()),
                 name: "beta".to_string(),
+                path: Some("/beta".to_string()),
                 sessions: vec![test_session("beta", "one"), test_session("beta", "two")],
             },
             ProjectGroup {
                 project_id: Some("gamma".to_string()),
                 group_id: Some("gamma-group".to_string()),
                 name: "gamma".to_string(),
+                path: Some("/gamma".to_string()),
                 sessions: vec![test_session("gamma", "one")],
             },
         ]);
@@ -1513,6 +2168,7 @@ mod tests {
             project_id: Some("alpha".to_string()),
             group_id: Some("alpha-group".to_string()),
             name: "alpha".to_string(),
+            path: Some("/alpha".to_string()),
             sessions: vec![
                 SessionItem {
                     activity: Some("working".to_string()),
