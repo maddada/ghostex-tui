@@ -231,7 +231,7 @@ impl PtySession {
 
         CDXC:GhostexTui 2026-05-25-15:50:
         The attached session PTY is rendered by Ghostex TUI, not by the outer
-        shell that launched `gtx`. Force a real terminal identity so Codex CLI,
+        shell that launched `gx`. Force a real terminal identity so Codex CLI,
         Starship, and other terminal-aware tools do not inherit TERM=dumb from
         desktop launchers or non-terminal hosts.
 
@@ -380,7 +380,7 @@ impl App {
         app.refresh_sessions(false);
         /*
         CDXC:GhostexTui 2026-05-25-15:11:
-        Bare `gtx` should open on the project/session switcher, not auto-attach
+        Bare `gx` should open on the project/session switcher, not auto-attach
         the first sidebar session. Session PTYs are spawned only after the user
         clicks a row or presses Enter/Space, so saved resume-command output from
         an arbitrary first session cannot appear as launch errors.
@@ -1906,7 +1906,7 @@ fn switch_rows(groups: &[ProjectGroup]) -> Vec<SwitchRow> {
 }
 
 fn ghostex_cli_command() -> String {
-    std::env::var("GHOSTEX_TUI_CLI_COMMAND").unwrap_or_else(|_| "gtx".to_string())
+    std::env::var("GHOSTEX_TUI_CLI_COMMAND").unwrap_or_else(|_| "gx".to_string())
 }
 
 fn shell_quote(value: &str) -> String {
