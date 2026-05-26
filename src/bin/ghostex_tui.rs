@@ -1,10 +1,14 @@
 use std::collections::{BTreeMap, HashSet};
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
+use std::path::PathBuf;
 use std::process::Command;
-use std::sync::mpsc;
-use std::thread;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
     MouseButton, MouseEvent, MouseEventKind,
@@ -13,7 +17,7 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
+use herdr::{config, events, layout, pane, terminal, terminal_theme};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -21,10 +25,11 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use serde::Deserialize;
+use tokio::sync::{mpsc as tokio_mpsc, Notify};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(16);
 const SESSION_LIST_REFRESH: Duration = Duration::from_secs(5);
-const TERMINAL_SCROLLBACK_LINES: usize = 10_000;
+const TERMINAL_SCROLLBACK_BYTES: usize = config::DEFAULT_SCROLLBACK_LIMIT_BYTES;
 const MOUSE_SCROLL_LINES: usize = 3;
 const GHOSTEX_TUI_TERM: &str = "xterm-256color";
 const GHOSTEX_TUI_COLORTERM: &str = "truecolor";
@@ -192,13 +197,11 @@ enum InputPromptAction {
 }
 
 struct PtySession {
-    master: Box<dyn MasterPty + Send>,
-    child: Box<dyn Child + Send + Sync>,
-    writer: Box<dyn Write + Send>,
-    rx: mpsc::Receiver<Vec<u8>>,
-    parser: vt100::Parser,
-    mouse_alternate_scroll: bool,
-    terminal_mode_buffer: Vec<u8>,
+    pane_id: layout::PaneId,
+    runtime: terminal::TerminalRuntime,
+    events_rx: tokio_mpsc::Receiver<events::AppEvent>,
+    render_dirty: Arc<AtomicBool>,
+    _render_notify: Arc<Notify>,
 }
 
 impl PtySession {
@@ -208,145 +211,128 @@ impl PtySession {
             ghostex_cli_command(),
             shell_quote(&session.session_id)
         );
-        let pty_system = native_pty_system();
-        let pair = pty_system
-            .openpty(PtySize {
-                rows: area.height.max(1),
-                cols: area.width.max(1),
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .map_err(io_other)?;
-        let mut command = CommandBuilder::new("/bin/zsh");
-        command.arg("-lc");
-        command.arg(shell_command);
+        let pane_id = layout::PaneId::alloc();
+        let (events_tx, events_rx) = tokio_mpsc::channel(32);
+        let render_notify = Arc::new(Notify::new());
+        let render_dirty = Arc::new(AtomicBool::new(false));
+        let cwd = session
+            .project_path
+            .as_deref()
+            .filter(|path| !path.trim().is_empty())
+            .map(PathBuf::from)
+            .unwrap_or(std::env::current_dir()?);
         /*
+        CDXC:GhostexTui 2026-05-26-10:41:
+        Attached Ghostex panes must use Herdr's Ghostty-backed TerminalRuntime,
+        not the earlier vt100 wrapper. The user expects mouse wheel scrollback
+        to behave exactly like Herdr after `zmx attach`, while alternate-screen
+        apps still receive mouse reports or xterm alternate-scroll when they
+        explicitly enable those terminal modes.
+
         CDXC:GhostexTui 2026-05-25-15:50:
         The attached session PTY is rendered by Ghostex TUI, not by the outer
         shell that launched `gtx`. Force a real terminal identity so Codex CLI,
         Starship, and other terminal-aware tools do not inherit TERM=dumb from
         desktop launchers or non-terminal hosts.
         */
-        command.env("TERM", GHOSTEX_TUI_TERM);
-        command.env("COLORTERM", GHOSTEX_TUI_COLORTERM);
-        command.env("TERM_PROGRAM", "ghostex-tui");
-        let child = pair.slave.spawn_command(command).map_err(io_other)?;
-        drop(pair.slave);
-        let mut reader = pair.master.try_clone_reader().map_err(io_other)?;
-        let writer = pair.master.take_writer().map_err(io_other)?;
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            let mut buffer = [0u8; 8192];
-            loop {
-                match reader.read(&mut buffer) {
-                    Ok(0) => break,
-                    Ok(read) => {
-                        if tx.send(buffer[..read].to_vec()).is_err() {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
-        /*
-        CDXC:GhostexTui 2026-05-25-17:18:
-        Attached Ghostex panes must scroll like Herdr panes after `zmx attach`.
-        Keep scrollback inside the TUI-owned terminal parser because the outer
-        alternate screen cannot provide normal terminal scrollback for rendered
-        pane contents.
-        */
-        let parser = vt100::Parser::new(
+        let runtime = terminal::TerminalRuntime::spawn_shell_command(
+            pane_id,
             area.height.max(1),
             area.width.max(1),
-            TERMINAL_SCROLLBACK_LINES,
-        );
+            cwd,
+            &shell_command,
+            &[
+                ("TERM".to_string(), GHOSTEX_TUI_TERM.to_string()),
+                ("COLORTERM".to_string(), GHOSTEX_TUI_COLORTERM.to_string()),
+                ("TERM_PROGRAM".to_string(), "ghostex-tui".to_string()),
+            ],
+            TERMINAL_SCROLLBACK_BYTES,
+            terminal_theme::TerminalTheme::default(),
+            events_tx,
+            render_notify.clone(),
+            render_dirty.clone(),
+        )?;
         Ok(Self {
-            master: pair.master,
-            child,
-            writer,
-            rx,
-            parser,
-            mouse_alternate_scroll: false,
-            terminal_mode_buffer: Vec::new(),
+            pane_id,
+            runtime,
+            events_rx,
+            render_dirty,
+            _render_notify: render_notify,
         })
     }
 
-    fn resize(&mut self, area: Rect) {
-        let _ = self.master.resize(PtySize {
-            rows: area.height.max(1),
-            cols: area.width.max(1),
-            pixel_width: 0,
-            pixel_height: 0,
-        });
-        self.parser.set_size(area.height.max(1), area.width.max(1));
+    fn resize(&self, area: Rect) {
+        self.runtime
+            .resize(area.height.max(1), area.width.max(1), 0, 0);
     }
 
     fn drain_output(&mut self) {
-        while let Ok(bytes) = self.rx.try_recv() {
-            update_terminal_mode_state(
-                &mut self.terminal_mode_buffer,
-                &mut self.mouse_alternate_scroll,
-                &bytes,
-            );
-            self.parser.process(&bytes);
+        self.render_dirty.swap(false, Ordering::AcqRel);
+        while let Ok(event) = self.events_rx.try_recv() {
+            if let events::AppEvent::PaneDied { pane_id } = event {
+                if pane_id == self.pane_id {
+                    break;
+                }
+            }
         }
     }
 
-    fn scroll_up(&mut self, lines: usize) {
-        let next = self.parser.screen().scrollback().saturating_add(lines);
-        self.parser.set_scrollback(next);
-    }
-
-    fn scroll_down(&mut self, lines: usize) {
-        let next = self.parser.screen().scrollback().saturating_sub(lines);
-        self.parser.set_scrollback(next);
-    }
-
-    fn scroll_reset(&mut self) {
-        self.parser.set_scrollback(0);
+    fn handle_mouse(&mut self, mouse: MouseEvent, terminal_rect: Rect) {
+        if matches!(
+            mouse.kind,
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+        ) {
+            self.handle_wheel(mouse, terminal_rect);
+            return;
+        }
+        let column = mouse.column.saturating_sub(terminal_rect.x);
+        let row = mouse.row.saturating_sub(terminal_rect.y);
+        if let Some(bytes) =
+            self.runtime
+                .encode_mouse_button(mouse.kind, column, row, mouse.modifiers)
+        {
+            self.runtime.scroll_reset();
+            self.write_input(bytes);
+        }
     }
 
     fn handle_wheel(&mut self, mouse: MouseEvent, terminal_rect: Rect) {
-        let column = mouse.column.saturating_sub(terminal_rect.x);
-        let row = mouse.row.saturating_sub(terminal_rect.y);
-        if self.parser.screen().mouse_protocol_mode() != vt100::MouseProtocolMode::None {
-            if let Some(bytes) = encode_mouse_scroll(
-                mouse.kind,
-                column,
-                row,
-                mouse.modifiers,
-                self.parser.screen().mouse_protocol_encoding(),
-            ) {
-                self.write_input(&bytes);
+        match self.runtime.wheel_routing() {
+            Some(pane::WheelRouting::HostScroll) | None => match mouse.kind {
+                MouseEventKind::ScrollUp => self.runtime.scroll_up(MOUSE_SCROLL_LINES),
+                MouseEventKind::ScrollDown => self.runtime.scroll_down(MOUSE_SCROLL_LINES),
+                _ => {}
+            },
+            Some(pane::WheelRouting::MouseReport) => {
+                self.runtime.scroll_reset();
+                let column = mouse.column.saturating_sub(terminal_rect.x);
+                let row = mouse.row.saturating_sub(terminal_rect.y);
+                if let Some(bytes) =
+                    self.runtime
+                        .encode_mouse_wheel(mouse.kind, column, row, mouse.modifiers)
+                {
+                    self.write_input(bytes);
+                }
             }
-            return;
-        }
-        if self.parser.screen().alternate_screen() && self.mouse_alternate_scroll {
-            if let Some(bytes) =
-                encode_alternate_scroll(mouse.kind, self.parser.screen().application_cursor())
-            {
-                self.write_input(&bytes);
+            Some(pane::WheelRouting::AlternateScroll) => {
+                self.runtime.scroll_reset();
+                if let Some(bytes) = self.runtime.encode_alternate_scroll(mouse.kind) {
+                    self.write_input(bytes);
+                }
             }
-            return;
-        }
-        match mouse.kind {
-            MouseEventKind::ScrollUp => self.scroll_up(MOUSE_SCROLL_LINES),
-            MouseEventKind::ScrollDown => self.scroll_down(MOUSE_SCROLL_LINES),
-            _ => {}
         }
     }
 
-    fn write_input(&mut self, bytes: &[u8]) {
-        self.scroll_reset();
-        let _ = self.writer.write_all(bytes);
-        let _ = self.writer.flush();
+    fn write_key(&mut self, key: KeyEvent) {
+        let bytes = self.runtime.encode_terminal_key(key.into());
+        if !bytes.is_empty() {
+            self.runtime.scroll_reset();
+            self.write_input(bytes);
+        }
     }
-}
 
-impl Drop for PtySession {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
+    fn write_input(&mut self, bytes: Vec<u8>) {
+        let _ = self.runtime.try_send_bytes(Bytes::from(bytes));
     }
 }
 
@@ -713,7 +699,8 @@ impl Drop for TerminalGuard {
     }
 }
 
-fn main() -> io::Result<()> {
+#[tokio::main]
+async fn main() -> io::Result<()> {
     let _guard = TerminalGuard::enter()?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
@@ -884,8 +871,7 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
                 .alignment(Alignment::Right),
             Rect::new(
                 status.x
-                    + status_width
-                        .saturating_sub(count_width.saturating_add(count_right_margin)),
+                    + status_width.saturating_sub(count_width.saturating_add(count_right_margin)),
                 status.y + 2,
                 count_width,
                 1,
@@ -933,120 +919,13 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_terminal(frame: &mut Frame, app: &mut App, area: Rect) {
-    if let Some(pty) = app.pty.as_mut() {
-        let screen = pty.parser.screen();
-        /*
-        CDXC:GhostexTui 2026-05-25-16:00:
-        Ghostex TUI attaches through `zmx`, unlike Herdr's native pane runtime,
-        but the PTY parser still stores ANSI attributes per cell. Render cells
-        as styled spans instead of `screen.rows(...)` so Codex, Starship, and
-        CLI color output keep foreground, background, truecolor, and text modes.
-        */
-        for row in 0..area.height {
-            frame.render_widget(
-                Paragraph::new(Line::from(render_terminal_row(screen, row, area.width))),
-                Rect::new(area.x, area.y + row, area.width, 1),
-            );
-        }
-        render_terminal_cursor(frame, screen, area);
+    if let Some(pty) = app.pty.as_ref() {
+        pty.runtime.render(frame, area, true);
     } else {
         frame.render_widget(
             Paragraph::new(app.status.as_str()).style(Style::default().fg(Color::Red)),
             area,
         );
-    }
-}
-
-fn render_terminal_cursor(frame: &mut Frame, screen: &vt100::Screen, area: Rect) {
-    /*
-    CDXC:GhostexTui 2026-05-26-09:18:
-    Attached panes must expose the child terminal cursor like Herdr does.
-    The vt100 cell renderer paints text attributes but not the hardware cursor,
-    so set the frame cursor after rows render and suppress it when the child
-    hides the cursor or the viewport is scrolled back.
-    */
-    let Some((x, y)) = terminal_cursor_position(screen, area) else {
-        return;
-    };
-    frame.set_cursor_position((x, y));
-}
-
-fn terminal_cursor_position(screen: &vt100::Screen, area: Rect) -> Option<(u16, u16)> {
-    if screen.hide_cursor() || screen.scrollback() > 0 {
-        return None;
-    }
-    let (row, col) = screen.cursor_position();
-    if row >= area.height || col >= area.width {
-        return None;
-    }
-    Some((area.x + col, area.y + row))
-}
-
-fn render_terminal_row(screen: &vt100::Screen, row: u16, width: u16) -> Vec<Span<'static>> {
-    let mut spans = Vec::new();
-    let mut current_text = String::new();
-    let mut current_style: Option<Style> = None;
-    for col in 0..width {
-        let Some(cell) = screen.cell(row, col) else {
-            push_terminal_span(&mut spans, &mut current_text, &mut current_style);
-            continue;
-        };
-        if cell.is_wide_continuation() {
-            continue;
-        }
-        let style = terminal_cell_style(cell);
-        if current_style.is_some_and(|existing| existing != style) {
-            push_terminal_span(&mut spans, &mut current_text, &mut current_style);
-        }
-        current_style = Some(style);
-        if cell.has_contents() {
-            current_text.push_str(&cell.contents());
-        } else {
-            current_text.push(' ');
-        }
-    }
-    push_terminal_span(&mut spans, &mut current_text, &mut current_style);
-    spans
-}
-
-fn push_terminal_span(
-    spans: &mut Vec<Span<'static>>,
-    current_text: &mut String,
-    current_style: &mut Option<Style>,
-) {
-    if current_text.is_empty() {
-        return;
-    }
-    spans.push(Span::styled(
-        std::mem::take(current_text),
-        current_style.take().unwrap_or_default(),
-    ));
-}
-
-fn terminal_cell_style(cell: &vt100::Cell) -> Style {
-    let mut fg = terminal_color(cell.fgcolor());
-    let mut bg = terminal_color(cell.bgcolor());
-    if cell.inverse() {
-        std::mem::swap(&mut fg, &mut bg);
-    }
-    let mut style = Style::default().fg(fg).bg(bg);
-    if cell.bold() {
-        style = style.add_modifier(Modifier::BOLD);
-    }
-    if cell.italic() {
-        style = style.add_modifier(Modifier::ITALIC);
-    }
-    if cell.underline() {
-        style = style.add_modifier(Modifier::UNDERLINED);
-    }
-    style
-}
-
-fn terminal_color(color: vt100::Color) -> Color {
-    match color {
-        vt100::Color::Default => Color::Reset,
-        vt100::Color::Idx(index) => Color::Indexed(index),
-        vt100::Color::Rgb(red, green, blue) => Color::Rgb(red, green, blue),
     }
 }
 
@@ -1402,10 +1281,8 @@ fn handle_key(app: &mut App, key: KeyEvent, terminal_rect: Rect) -> bool {
                 app.refresh_sessions(false);
                 return false;
             }
-            if let Some(bytes) = encode_key(key) {
-                if let Some(pty) = app.pty.as_mut() {
-                    pty.write_input(&bytes);
-                }
+            if let Some(pty) = app.pty.as_mut() {
+                pty.write_key(key);
             }
         }
     }
@@ -1484,13 +1361,9 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, full: Rect, terminal_rect: Rec
                 app.mode = Mode::Switcher;
                 app.refresh_sessions(false);
             }
-            if matches!(
-                mouse.kind,
-                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
-            ) && rect_contains(terminal_rect, mouse.column, mouse.row)
-            {
+            if rect_contains(terminal_rect, mouse.column, mouse.row) {
                 if let Some(pty) = app.pty.as_mut() {
-                    pty.handle_wheel(mouse, terminal_rect);
+                    pty.handle_mouse(mouse, terminal_rect);
                 }
             }
         }
@@ -1958,10 +1831,6 @@ fn run_ghostex_cli(args: &[String]) -> io::Result<Vec<u8>> {
     Ok(output.stdout)
 }
 
-fn io_other(error: impl std::fmt::Display) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, error.to_string())
-}
-
 fn group_sessions(sessions: Vec<SessionItem>) -> Vec<ProjectGroup> {
     let mut indexes = BTreeMap::<String, usize>::new();
     let mut groups = Vec::<ProjectGroup>::new();
@@ -2139,164 +2008,6 @@ fn wrap_index(index: isize, len: usize) -> usize {
     (((index % len) + len) % len) as usize
 }
 
-fn update_terminal_mode_state(
-    buffer: &mut Vec<u8>,
-    mouse_alternate_scroll: &mut bool,
-    bytes: &[u8],
-) {
-    /*
-    CDXC:GhostexTui 2026-05-25-18:24:
-    Herdr only routes wheel events to alternate-scroll arrow keys when the
-    child enables xterm mode 1007. Track `CSI ? ... 1007 ... h/l` directly from
-    the PTY stream because vt100 exposes alternate screen and mouse reporting
-    but not the mouse-alternate-scroll mode Ghostty uses for wheel routing.
-    */
-    for byte in bytes {
-        if *byte == 0x1b {
-            buffer.clear();
-            buffer.push(*byte);
-            continue;
-        }
-        if buffer.is_empty() {
-            continue;
-        }
-        buffer.push(*byte);
-        if buffer.len() > 128 {
-            buffer.clear();
-            continue;
-        }
-        if matches!(*byte, b'h' | b'l') {
-            if terminal_mode_sequence_contains(buffer, "1007") {
-                *mouse_alternate_scroll = *byte == b'h';
-            }
-            buffer.clear();
-        }
-    }
-}
-
-fn terminal_mode_sequence_contains(buffer: &[u8], needle: &str) -> bool {
-    if !buffer.starts_with(b"\x1b[?") {
-        return false;
-    }
-    let Some(final_byte) = buffer.last().copied() else {
-        return false;
-    };
-    if !matches!(final_byte, b'h' | b'l') {
-        return false;
-    }
-    let params = &buffer[3..buffer.len().saturating_sub(1)];
-    std::str::from_utf8(params)
-        .ok()
-        .is_some_and(|params| params.split(';').any(|param| param == needle))
-}
-
-fn encode_mouse_scroll(
-    kind: MouseEventKind,
-    column: u16,
-    row: u16,
-    modifiers: KeyModifiers,
-    encoding: vt100::MouseProtocolEncoding,
-) -> Option<Vec<u8>> {
-    let button = match kind {
-        MouseEventKind::ScrollUp => 64u16,
-        MouseEventKind::ScrollDown => 65u16,
-        _ => return None,
-    };
-    encode_mouse_cb(button, false, column, row, modifiers, encoding)
-}
-
-fn encode_mouse_cb(
-    base_button: u16,
-    release: bool,
-    column: u16,
-    row: u16,
-    modifiers: KeyModifiers,
-    encoding: vt100::MouseProtocolEncoding,
-) -> Option<Vec<u8>> {
-    let mut cb = match (encoding, release) {
-        (vt100::MouseProtocolEncoding::Sgr, true) => base_button,
-        (_, true) => 3,
-        (_, false) => base_button,
-    };
-    if modifiers.contains(KeyModifiers::SHIFT) {
-        cb += 4;
-    }
-    if modifiers.contains(KeyModifiers::ALT) {
-        cb += 8;
-    }
-    if modifiers.contains(KeyModifiers::CONTROL) {
-        cb += 16;
-    }
-    let column = column as u32 + 1;
-    let row = row as u32 + 1;
-    match encoding {
-        vt100::MouseProtocolEncoding::Sgr => Some(
-            format!(
-                "\x1b[<{cb};{column};{row}{}",
-                if release { 'm' } else { 'M' }
-            )
-            .into_bytes(),
-        ),
-        vt100::MouseProtocolEncoding::Default => {
-            let cb = u8::try_from(cb + 32).ok()?;
-            let column = u8::try_from(column + 32).ok()?;
-            let row = u8::try_from(row + 32).ok()?;
-            Some(vec![0x1b, b'[', b'M', cb, column, row])
-        }
-        vt100::MouseProtocolEncoding::Utf8 => {
-            let mut bytes = Vec::with_capacity(16);
-            bytes.extend_from_slice(b"\x1b[M");
-            push_mouse_codepoint(&mut bytes, cb as u32 + 32)?;
-            push_mouse_codepoint(&mut bytes, column + 32)?;
-            push_mouse_codepoint(&mut bytes, row + 32)?;
-            Some(bytes)
-        }
-    }
-}
-
-fn push_mouse_codepoint(bytes: &mut Vec<u8>, value: u32) -> Option<()> {
-    let ch = char::from_u32(value)?;
-    let mut buf = [0u8; 4];
-    bytes.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
-    Some(())
-}
-
-fn encode_alternate_scroll(kind: MouseEventKind, application_cursor: bool) -> Option<Vec<u8>> {
-    match (kind, application_cursor) {
-        (MouseEventKind::ScrollUp, true) => Some(b"\x1bOA".to_vec()),
-        (MouseEventKind::ScrollDown, true) => Some(b"\x1bOB".to_vec()),
-        (MouseEventKind::ScrollUp, false) => Some(b"\x1b[A".to_vec()),
-        (MouseEventKind::ScrollDown, false) => Some(b"\x1b[B".to_vec()),
-        _ => None,
-    }
-}
-
-fn encode_key(key: KeyEvent) -> Option<Vec<u8>> {
-    match key.code {
-        KeyCode::Char(ch) if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            let lower = ch.to_ascii_lowercase() as u8;
-            if lower.is_ascii_lowercase() {
-                Some(vec![lower - b'a' + 1])
-            } else {
-                None
-            }
-        }
-        KeyCode::Char(ch) => Some(ch.to_string().into_bytes()),
-        KeyCode::Enter => Some(b"\r".to_vec()),
-        KeyCode::Tab => Some(b"\t".to_vec()),
-        KeyCode::Backspace => Some(vec![0x7f]),
-        KeyCode::Esc => Some(vec![0x1b]),
-        KeyCode::Left => Some(b"\x1b[D".to_vec()),
-        KeyCode::Right => Some(b"\x1b[C".to_vec()),
-        KeyCode::Up => Some(b"\x1b[A".to_vec()),
-        KeyCode::Down => Some(b"\x1b[B".to_vec()),
-        KeyCode::Delete => Some(b"\x1b[3~".to_vec()),
-        KeyCode::Home => Some(b"\x1b[H".to_vec()),
-        KeyCode::End => Some(b"\x1b[F".to_vec()),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2385,48 +2096,6 @@ mod tests {
     }
 
     #[test]
-    fn terminal_row_preserves_ansi_colors_and_modes() {
-        let mut parser = vt100::Parser::new(2, 80, 0);
-        parser.process(
-            b"\x1b[31mred\x1b[0m \x1b[1;35mbold-purple\x1b[0m \x1b[38;2;80;180;255mtruecolor\x1b[0m",
-        );
-
-        let spans = render_terminal_row(parser.screen(), 0, 80);
-
-        assert!(
-            spans
-                .iter()
-                .any(|span| span.content.as_ref() == "red"
-                    && span.style.fg == Some(Color::Indexed(1)))
-        );
-        assert!(spans.iter().any(|span| {
-            span.content.as_ref() == "bold-purple"
-                && span.style.fg == Some(Color::Indexed(5))
-                && span.style.add_modifier.contains(Modifier::BOLD)
-        }));
-        assert!(spans.iter().any(|span| {
-            span.content.as_ref() == "truecolor" && span.style.fg == Some(Color::Rgb(80, 180, 255))
-        }));
-    }
-
-    #[test]
-    fn terminal_cursor_position_tracks_visible_vt100_cursor() {
-        let mut parser = vt100::Parser::new(4, 20, 10);
-        parser.process(b"\x1b[3;5H");
-
-        assert_eq!(
-            terminal_cursor_position(parser.screen(), Rect::new(10, 20, 20, 4)),
-            Some((14, 22))
-        );
-
-        parser.process(b"\x1b[?25l");
-        assert_eq!(
-            terminal_cursor_position(parser.screen(), Rect::new(10, 20, 20, 4)),
-            None
-        );
-    }
-
-    #[test]
     fn session_activity_prefers_sidebar_activity_over_lifecycle_status() {
         let mut session = test_session("alpha", "one");
         session.status = "done".to_string();
@@ -2461,21 +2130,5 @@ mod tests {
 
         assert_eq!(app.activity_count(SessionActivity::Working), 1);
         assert_eq!(app.activity_count(SessionActivity::Attention), 1);
-    }
-
-    #[test]
-    fn terminal_mode_tracking_follows_xterm_alternate_scroll() {
-        let mut buffer = Vec::new();
-        let mut mouse_alternate_scroll = false;
-
-        update_terminal_mode_state(
-            &mut buffer,
-            &mut mouse_alternate_scroll,
-            b"\x1b[?1000;1007h",
-        );
-        assert!(mouse_alternate_scroll);
-
-        update_terminal_mode_state(&mut buffer, &mut mouse_alternate_scroll, b"\x1b[?1007l");
-        assert!(!mouse_alternate_scroll);
     }
 }
