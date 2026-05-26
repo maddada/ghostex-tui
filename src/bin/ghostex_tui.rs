@@ -235,11 +235,9 @@ impl PtySession {
         Starship, and other terminal-aware tools do not inherit TERM=dumb from
         desktop launchers or non-terminal hosts.
 
-        CDXC:GhostexTui 2026-05-26-11:22:
-        The TUI has its own Ghostty-backed scrollback surface, so it should ask
-        the Ghostex CLI for a full zmx replay when attaching. Mobile clients keep
-        the visible-only attach path because their native surfaces need the
-        first viewport immediately and cannot always absorb desktop scrollback.
+        CDXC:GhostexTui 2026-05-26-11:29:
+        The CLI attach path now uses full zmx replay for all live zmx clients,
+        so the TUI does not need a special attach marker to receive scrollback.
         */
         let runtime = terminal::TerminalRuntime::spawn_shell_command(
             pane_id,
@@ -251,7 +249,6 @@ impl PtySession {
                 ("TERM".to_string(), GHOSTEX_TUI_TERM.to_string()),
                 ("COLORTERM".to_string(), GHOSTEX_TUI_COLORTERM.to_string()),
                 ("TERM_PROGRAM".to_string(), "ghostex-tui".to_string()),
-                ("GHOSTEX_TUI_FULL_REPLAY".to_string(), "1".to_string()),
             ],
             TERMINAL_SCROLLBACK_BYTES,
             terminal_theme::TerminalTheme::default(),
