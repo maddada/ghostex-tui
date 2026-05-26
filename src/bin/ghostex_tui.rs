@@ -452,6 +452,16 @@ impl App {
     }
 
     fn attach(&mut self, session: SessionItem, area: Rect) {
+        /*
+        CDXC:GhostexTui 2026-05-26-13:03:
+        Attaching to an attention session from GTX TUI means the user has seen
+        that shared attention event. Acknowledge through the Ghostex CLI bridge
+        so the desktop sidebar and any other TUI clients clear the same event.
+        */
+        if session_activity(&session) == Some(SessionActivity::Attention) {
+            let _ = acknowledge_session_attention(&session);
+            self.known_attention_session_ids.remove(&session.session_id);
+        }
         match PtySession::spawn(&session, area) {
             Ok(pty) => {
                 self.pty = Some(pty);
@@ -1770,6 +1780,15 @@ fn create_terminal(
 fn run_session_command(command: &str, session: &SessionItem) -> io::Result<()> {
     run_ghostex_cli(&[
         command.to_string(),
+        "--session-id".to_string(),
+        session.session_id.clone(),
+    ])
+    .map(|_| ())
+}
+
+fn acknowledge_session_attention(session: &SessionItem) -> io::Result<()> {
+    run_ghostex_cli(&[
+        "acknowledge-session-attention".to_string(),
         "--session-id".to_string(),
         session.session_id.clone(),
     ])
