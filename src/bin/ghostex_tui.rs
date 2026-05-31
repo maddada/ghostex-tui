@@ -1634,20 +1634,14 @@ fn execute_context_action(app: &mut App, action: ContextAction, terminal_rect: R
             });
             Ok(())
         }
-        ContextActionKind::SessionFavorite { session, favorite } => run_ghostex_cli(&[
-            "favorite-session".to_string(),
-            "--session-id".to_string(),
-            session.session_id,
-            favorite.to_string(),
-        ])
-        .map(|_| ()),
-        ContextActionKind::SessionSleep { session, sleeping } => run_ghostex_cli(&[
-            "sleep-session".to_string(),
-            "--session-id".to_string(),
-            session.session_id,
-            sleeping.to_string(),
-        ])
-        .map(|_| ()),
+        ContextActionKind::SessionFavorite { session, favorite } => {
+            run_ghostex_cli(&session_command_args("favorite-session", &session, Some(favorite)))
+                .map(|_| ())
+        }
+        ContextActionKind::SessionSleep { session, sleeping } => {
+            run_ghostex_cli(&session_command_args("sleep-session", &session, Some(sleeping)))
+                .map(|_| ())
+        }
         ContextActionKind::CopyResumeCommand(session) => copy_text(
             session
                 .resume_command
@@ -1728,14 +1722,11 @@ fn execute_context_action(app: &mut App, action: ContextAction, terminal_rect: R
 
 fn execute_input_prompt(app: &mut App, prompt: InputPrompt) {
     let result = match prompt.action {
-        InputPromptAction::RenameSession(session) => run_ghostex_cli(&[
-            "rename-session".to_string(),
-            "--session-id".to_string(),
-            session.session_id,
-            "--title".to_string(),
-            prompt.value,
-        ])
-        .map(|_| ()),
+        InputPromptAction::RenameSession(session) => {
+            let mut args = session_command_args("rename-session", &session, None);
+            args.extend(["--title".to_string(), prompt.value]);
+            run_ghostex_cli(&args).map(|_| ())
+        }
     };
     match result {
         Ok(()) => {
@@ -1778,21 +1769,39 @@ fn create_terminal(
 }
 
 fn run_session_command(command: &str, session: &SessionItem) -> io::Result<()> {
-    run_ghostex_cli(&[
-        command.to_string(),
-        "--session-id".to_string(),
-        session.session_id.clone(),
-    ])
+    run_ghostex_cli(&session_command_args(command, session, None))
     .map(|_| ())
 }
 
 fn acknowledge_session_attention(session: &SessionItem) -> io::Result<()> {
-    run_ghostex_cli(&[
-        "acknowledge-session-attention".to_string(),
+    run_ghostex_cli(&session_command_args("acknowledge-session-attention", session, None))
+    .map(|_| ())
+}
+
+fn session_command_args(command: &str, session: &SessionItem, boolean: Option<bool>) -> Vec<String> {
+    /*
+     * CDXC:GxTuiSessions 2026-05-31-08:45:
+     * The TUI renders the shared `ghostex sessions --json` inventory and should
+     * pass both projectId and sessionId back for gxserver-scoped lifecycle
+     * actions. Keep bare session-id fallback in the CLI, but make the TUI's
+     * normal path direct like macOS, Android, iOS, and `gx ls`.
+     */
+    let mut args = vec![
+        command.to_string(),
         "--session-id".to_string(),
         session.session_id.clone(),
-    ])
-    .map(|_| ())
+    ];
+    if let Some(project_id) = session
+        .project_id
+        .as_ref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        args.extend(["--project-id".to_string(), project_id.to_string()]);
+    }
+    if let Some(value) = boolean {
+        args.push(value.to_string());
+    }
+    args
 }
 
 fn run_project_session_command(
@@ -1801,14 +1810,7 @@ fn run_project_session_command(
     boolean: Option<bool>,
 ) -> io::Result<()> {
     for session in sessions {
-        let mut args = vec![
-            command.to_string(),
-            "--session-id".to_string(),
-            session.session_id.clone(),
-        ];
-        if let Some(value) = boolean {
-            args.push(value.to_string());
-        }
+        let args = session_command_args(command, session, boolean);
         run_ghostex_cli(&args)?;
     }
     Ok(())
