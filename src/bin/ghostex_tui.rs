@@ -206,11 +206,7 @@ struct PtySession {
 
 impl PtySession {
     fn spawn(session: &SessionItem, area: Rect) -> io::Result<Self> {
-        let shell_command = format!(
-            "{} attach --session-id {}",
-            ghostex_cli_command(),
-            shell_quote(&session.session_id)
-        );
+        let shell_command = attach_shell_command(session);
         let pane_id = layout::PaneId::alloc();
         let (events_tx, events_rx) = tokio_mpsc::channel(32);
         let render_notify = Arc::new(Notify::new());
@@ -353,7 +349,7 @@ struct App {
     mode: Mode,
     switch_scroll: usize,
     last_refresh: Instant,
-    known_attention_session_ids: HashSet<String>,
+    known_attention_session_keys: HashSet<String>,
     has_loaded_session_statuses: bool,
     status: String,
 }
@@ -373,7 +369,7 @@ impl App {
             mode: Mode::Switcher,
             switch_scroll: 0,
             last_refresh: Instant::now() - SESSION_LIST_REFRESH,
-            known_attention_session_ids: HashSet::new(),
+            known_attention_session_keys: HashSet::new(),
             has_loaded_session_statuses: false,
             status: String::new(),
         };
@@ -398,29 +394,24 @@ impl App {
                 switcher dots, attached-view counts, and bell notifications use
                 the macOS app's activity source of truth instead of zmx state.
                 */
-                let next_attention_session_ids = attention_session_ids(&sessions);
+                let next_attention_session_keys = attention_session_keys(&sessions);
                 if bell_on_new_attention
                     && self.has_loaded_session_statuses
-                    && next_attention_session_ids
-                        .difference(&self.known_attention_session_ids)
+                    && next_attention_session_keys
+                        .difference(&self.known_attention_session_keys)
                         .next()
                         .is_some()
                 {
                     emit_terminal_bell();
                 }
-                self.known_attention_session_ids = next_attention_session_ids;
+                self.known_attention_session_keys = next_attention_session_keys;
                 self.has_loaded_session_statuses = true;
-                let selected_session_id = self
-                    .selected_session_at_row()
-                    .map(|session| session.session_id.clone());
-                let active_session_id = self
-                    .active_session
-                    .as_ref()
-                    .map(|session| session.session_id.clone());
+                let selected_session_key = self.selected_session_at_row().map(session_identity_key);
+                let active_session_key = self.active_session.as_ref().map(session_identity_key);
                 self.groups = group_sessions(sessions);
                 self.rows = switch_rows(&self.groups);
-                if let Some(selected_session_id) = selected_session_id {
-                    if let Some(row_index) = self.row_index_for_session_id(&selected_session_id) {
+                if let Some(selected_session_key) = selected_session_key {
+                    if let Some(row_index) = self.row_index_for_session_key(&selected_session_key) {
                         self.selected_row_index = row_index;
                     } else {
                         self.clamp_selected_row_to_selectable();
@@ -429,8 +420,8 @@ impl App {
                     self.clamp_selected_row_to_selectable();
                 }
                 self.sync_selected_session_index_from_row();
-                if let Some(active_session_id) = active_session_id {
-                    if let Some(session) = self.session_by_id(&active_session_id).cloned() {
+                if let Some(active_session_key) = active_session_key {
+                    if let Some(session) = self.session_by_key(&active_session_key).cloned() {
                         self.active_session = Some(session);
                     }
                 }
@@ -460,7 +451,8 @@ impl App {
         */
         if session_activity(&session) == Some(SessionActivity::Attention) {
             let _ = acknowledge_session_attention(&session);
-            self.known_attention_session_ids.remove(&session.session_id);
+            self.known_attention_session_keys
+                .remove(&session_identity_key(&session));
         }
         match PtySession::spawn(&session, area) {
             Ok(pty) => {
@@ -476,16 +468,16 @@ impl App {
         }
     }
 
-    fn session_by_id(&self, session_id: &str) -> Option<&SessionItem> {
+    fn session_by_key(&self, key: &str) -> Option<&SessionItem> {
         self.rows.iter().find_map(|row| match row {
-            SwitchRow::Session(session) if session.session_id == session_id => Some(session),
+            SwitchRow::Session(session) if session_identity_key(session) == key => Some(session),
             _ => None,
         })
     }
 
-    fn row_index_for_session_id(&self, session_id: &str) -> Option<usize> {
+    fn row_index_for_session_key(&self, key: &str) -> Option<usize> {
         self.rows.iter().position(
-            |row| matches!(row, SwitchRow::Session(session) if session.session_id == session_id),
+            |row| matches!(row, SwitchRow::Session(session) if session_identity_key(session) == key),
         )
     }
 
@@ -994,12 +986,63 @@ fn session_activity(session: &SessionItem) -> Option<SessionActivity> {
     }
 }
 
-fn attention_session_ids(sessions: &[SessionItem]) -> HashSet<String> {
+fn attention_session_keys(sessions: &[SessionItem]) -> HashSet<String> {
     sessions
         .iter()
         .filter(|session| session_activity(session) == Some(SessionActivity::Attention))
-        .map(|session| session.session_id.clone())
+        .map(session_identity_key)
         .collect()
+}
+
+fn attach_shell_command(session: &SessionItem) -> String {
+    attach_shell_command_with_cli(&ghostex_cli_command(), session)
+}
+
+fn attach_shell_command_with_cli(cli_command: &str, session: &SessionItem) -> String {
+    /*
+     * CDXC:GhostexTui 2026-06-04-03:27:
+     * Ghostex TUI attaches by launching the shared CLI inside Herdr's PTY.
+     * Include projectId whenever the sidebar inventory provides it so attach
+     * resolves the same full S/P/G zmx session as macOS, Electron, mobile, and
+     * gxserver lifecycle actions instead of routing by a bare G id.
+     */
+    let mut command = format!(
+        "{cli_command} attach --session-id {}",
+        shell_quote(&session.session_id)
+    );
+    if let Some(project_id) = session
+        .project_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        command.push_str(" --project-id ");
+        command.push_str(&shell_quote(project_id));
+    }
+    command
+}
+
+fn session_identity_key(session: &SessionItem) -> String {
+    session_identity_key_parts(session.project_id.as_deref(), &session.session_id)
+}
+
+fn session_identity_key_parts(project_id: Option<&str>, session_id: &str) -> String {
+    /*
+     * CDXC:GhostexTui 2026-06-04-03:27:
+     * TUI switcher bookkeeping must preserve the project/session pair because
+     * gxserver G ids are project-scoped. Keep duplicate bare session ids
+     * distinct across refresh, active-session sync, attention acknowledgement,
+     * and create-then-attach flows.
+     */
+    let project_id = project_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("");
+    if project_id.is_empty() {
+        session_id.to_string()
+    } else {
+        format!("{project_id}/{session_id}")
+    }
 }
 
 fn emit_terminal_bell() {
@@ -1441,10 +1484,14 @@ fn handle_switch_action(app: &mut App, terminal_rect: Rect) {
                         .session
                         .and_then(|session| session.ghostex_id.or(session.session_id))
                     {
-                        if let Some(row_index) = app.row_index_for_session_id(&session_id) {
+                        let created_session_key =
+                            session_identity_key_parts(project_id.as_deref(), &session_id);
+                        if let Some(row_index) = app.row_index_for_session_key(&created_session_key)
+                        {
                             app.selected_row_index = row_index;
                             app.sync_selected_session_index_from_row();
-                            if let Some(session) = app.session_by_id(&session_id).cloned() {
+                            if let Some(session) = app.session_by_key(&created_session_key).cloned()
+                            {
                                 app.attach(session, terminal_rect);
                             }
                         } else {
@@ -1634,14 +1681,14 @@ fn execute_context_action(app: &mut App, action: ContextAction, terminal_rect: R
             });
             Ok(())
         }
-        ContextActionKind::SessionFavorite { session, favorite } => {
-            run_ghostex_cli(&session_command_args("favorite-session", &session, Some(favorite)))
-                .map(|_| ())
-        }
-        ContextActionKind::SessionSleep { session, sleeping } => {
-            run_ghostex_cli(&session_command_args("sleep-session", &session, Some(sleeping)))
-                .map(|_| ())
-        }
+        ContextActionKind::SessionFavorite { session, favorite } => run_ghostex_cli(
+            &session_command_args("favorite-session", &session, Some(favorite)),
+        )
+        .map(|_| ()),
+        ContextActionKind::SessionSleep { session, sleeping } => run_ghostex_cli(
+            &session_command_args("sleep-session", &session, Some(sleeping)),
+        )
+        .map(|_| ()),
         ContextActionKind::CopyResumeCommand(session) => copy_text(
             session
                 .resume_command
@@ -1769,16 +1816,23 @@ fn create_terminal(
 }
 
 fn run_session_command(command: &str, session: &SessionItem) -> io::Result<()> {
-    run_ghostex_cli(&session_command_args(command, session, None))
-    .map(|_| ())
+    run_ghostex_cli(&session_command_args(command, session, None)).map(|_| ())
 }
 
 fn acknowledge_session_attention(session: &SessionItem) -> io::Result<()> {
-    run_ghostex_cli(&session_command_args("acknowledge-session-attention", session, None))
+    run_ghostex_cli(&session_command_args(
+        "acknowledge-session-attention",
+        session,
+        None,
+    ))
     .map(|_| ())
 }
 
-fn session_command_args(command: &str, session: &SessionItem, boolean: Option<bool>) -> Vec<String> {
+fn session_command_args(
+    command: &str,
+    session: &SessionItem,
+    boolean: Option<bool>,
+) -> Vec<String> {
     /*
      * CDXC:GxTuiSessions 2026-05-31-08:45:
      * The TUI renders the shared `ghostex sessions --json` inventory and should
@@ -2070,7 +2124,7 @@ mod tests {
             mode: Mode::Switcher,
             switch_scroll: 0,
             last_refresh: Instant::now(),
-            known_attention_session_ids: HashSet::new(),
+            known_attention_session_keys: HashSet::new(),
             has_loaded_session_statuses: true,
             status: String::new(),
         }
@@ -2155,5 +2209,53 @@ mod tests {
 
         assert_eq!(app.activity_count(SessionActivity::Working), 1);
         assert_eq!(app.activity_count(SessionActivity::Attention), 1);
+    }
+
+    #[test]
+    fn attach_shell_command_includes_project_id_when_available() {
+        let mut session = test_session("P1aa", "one");
+        session.session_id = "G1aa".to_string();
+
+        assert_eq!(
+            attach_shell_command_with_cli("gx", &session),
+            "gx attach --session-id 'G1aa' --project-id 'P1aa'"
+        );
+    }
+
+    #[test]
+    fn duplicate_session_ids_match_by_project_scoped_key() {
+        let mut first = test_session("P1aa", "one");
+        first.session_id = "Gsame".to_string();
+        let mut second = test_session("P2bb", "two");
+        second.session_id = "Gsame".to_string();
+
+        let app = test_app(vec![
+            ProjectGroup {
+                project_id: first.project_id.clone(),
+                group_id: first.group_id.clone(),
+                name: "P1aa".to_string(),
+                path: Some("/P1aa".to_string()),
+                sessions: vec![first.clone()],
+            },
+            ProjectGroup {
+                project_id: second.project_id.clone(),
+                group_id: second.group_id.clone(),
+                name: "P2bb".to_string(),
+                path: Some("/P2bb".to_string()),
+                sessions: vec![second.clone()],
+            },
+        ]);
+
+        let first_key = session_identity_key(&first);
+        let second_key = session_identity_key(&second);
+
+        assert_ne!(first_key, second_key);
+        assert_eq!(app.row_index_for_session_key(&first_key), Some(2));
+        assert_eq!(app.row_index_for_session_key(&second_key), Some(5));
+        assert_eq!(
+            app.session_by_key(&second_key)
+                .map(|session| session.project_id.as_deref()),
+            Some(Some("P2bb"))
+        );
     }
 }
