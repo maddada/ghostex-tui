@@ -10,14 +10,15 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
-    MouseButton, MouseEvent, MouseEventKind,
+    self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    EnableFocusChange, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers, MouseButton,
+    MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use herdr::{config, events, layout, pane, terminal, terminal_theme};
+use herdr::{config, events, input, layout, pane, selection, terminal, terminal_theme};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -26,13 +27,17 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use ratatui::{Frame, Terminal};
 use serde::Deserialize;
 use tokio::sync::{mpsc as tokio_mpsc, Notify};
+use unicode_width::UnicodeWidthChar;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(16);
 const SESSION_LIST_REFRESH: Duration = Duration::from_secs(5);
+const SELECTION_AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(30);
 const TERMINAL_SCROLLBACK_BYTES: usize = config::DEFAULT_SCROLLBACK_LIMIT_BYTES;
 const MOUSE_SCROLL_LINES: usize = 3;
 const GHOSTEX_TUI_TERM: &str = "xterm-256color";
 const GHOSTEX_TUI_COLORTERM: &str = "truecolor";
+const HEADER_CONTROL_WIDTH: u16 = 9;
+const HEADER_PROJECT_LABEL_WIDTH: usize = 7;
 const WORKING_COLOR: Color = Color::Rgb(248, 173, 7);
 const ATTENTION_COLOR: Color = Color::Rgb(115, 231, 156);
 
@@ -123,6 +128,20 @@ struct ProjectHeader {
 enum Mode {
     Attached,
     Switcher,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttachedSelectionAutoscrollDirection {
+    Up,
+    Down,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AttachedSelectionAutoscroll {
+    direction: AttachedSelectionAutoscrollDirection,
+    last_mouse_screen_col: u16,
+    last_mouse_screen_row: u16,
+    terminal_rect: Rect,
 }
 
 #[derive(Debug, Clone)]
@@ -277,23 +296,17 @@ impl PtySession {
         }
     }
 
-    fn handle_mouse(&mut self, mouse: MouseEvent, terminal_rect: Rect) {
-        if matches!(
-            mouse.kind,
-            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
-        ) {
-            self.handle_wheel(mouse, terminal_rect);
-            return;
-        }
-        let column = mouse.column.saturating_sub(terminal_rect.x);
-        let row = mouse.row.saturating_sub(terminal_rect.y);
-        if let Some(bytes) =
+    fn forward_mouse_button(&mut self, mouse: MouseEvent, terminal_rect: Rect) -> bool {
+        let (column, row) = attached_terminal_mouse_cell(mouse, terminal_rect);
+        let Some(bytes) =
             self.runtime
                 .encode_mouse_button(mouse.kind, column, row, mouse.modifiers)
-        {
-            self.runtime.scroll_reset();
-            self.write_input(bytes);
-        }
+        else {
+            return false;
+        };
+        self.runtime.scroll_reset();
+        self.write_input(bytes);
+        true
     }
 
     fn handle_wheel(&mut self, mouse: MouseEvent, terminal_rect: Rect) {
@@ -305,8 +318,7 @@ impl PtySession {
             },
             Some(pane::WheelRouting::MouseReport) => {
                 self.runtime.scroll_reset();
-                let column = mouse.column.saturating_sub(terminal_rect.x);
-                let row = mouse.row.saturating_sub(terminal_rect.y);
+                let (column, row) = attached_terminal_mouse_cell(mouse, terminal_rect);
                 if let Some(bytes) =
                     self.runtime
                         .encode_mouse_wheel(mouse.kind, column, row, mouse.modifiers)
@@ -324,11 +336,17 @@ impl PtySession {
     }
 
     fn write_key(&mut self, key: KeyEvent) {
-        let bytes = self.runtime.encode_terminal_key(key.into());
+        let bytes = attached_terminal_key_override_bytes(key)
+            .unwrap_or_else(|| self.runtime.encode_terminal_key(key.into()));
         if !bytes.is_empty() {
             self.runtime.scroll_reset();
             self.write_input(bytes);
         }
+    }
+
+    async fn send_paste(&mut self, text: String) {
+        self.runtime.scroll_reset();
+        let _ = self.runtime.send_paste(text).await;
     }
 
     fn write_input(&mut self, bytes: Vec<u8>) {
@@ -346,6 +364,9 @@ struct App {
     input_prompt: Option<InputPrompt>,
     show_hotkeys: bool,
     pty: Option<PtySession>,
+    selection: Option<selection::Selection>,
+    selection_autoscroll: Option<AttachedSelectionAutoscroll>,
+    selection_autoscroll_deadline: Option<Instant>,
     mode: Mode,
     switch_scroll: usize,
     last_refresh: Instant,
@@ -366,6 +387,9 @@ impl App {
             input_prompt: None,
             show_hotkeys: false,
             pty: None,
+            selection: None,
+            selection_autoscroll: None,
+            selection_autoscroll_deadline: None,
             mode: Mode::Switcher,
             switch_scroll: 0,
             last_refresh: Instant::now() - SESSION_LIST_REFRESH,
@@ -442,6 +466,82 @@ impl App {
         }
     }
 
+    fn clear_selection(&mut self) {
+        self.selection = None;
+        self.stop_selection_autoscroll();
+    }
+
+    fn stop_selection_autoscroll(&mut self) {
+        self.selection_autoscroll = None;
+        self.selection_autoscroll_deadline = None;
+    }
+
+    fn tick_selection_autoscroll(&mut self, now: Instant, terminal_rect: Rect) {
+        let Some(deadline) = self.selection_autoscroll_deadline else {
+            return;
+        };
+        if now < deadline {
+            return;
+        }
+        let Some(autoscroll) = self.selection_autoscroll else {
+            self.selection_autoscroll_deadline = None;
+            return;
+        };
+        if autoscroll.terminal_rect != terminal_rect {
+            self.stop_selection_autoscroll();
+            return;
+        }
+        if !self
+            .selection
+            .as_ref()
+            .is_some_and(|selection| selection.is_dragging())
+        {
+            self.stop_selection_autoscroll();
+            return;
+        }
+        let Some(metrics) = self
+            .pty
+            .as_ref()
+            .and_then(|pty| pty.runtime.scroll_metrics())
+        else {
+            self.stop_selection_autoscroll();
+            return;
+        };
+        match autoscroll.direction {
+            AttachedSelectionAutoscrollDirection::Up => {
+                if metrics.offset_from_bottom >= metrics.max_offset_from_bottom {
+                    self.stop_selection_autoscroll();
+                    return;
+                }
+                if let Some(pty) = self.pty.as_ref() {
+                    pty.runtime.scroll_up(1);
+                }
+            }
+            AttachedSelectionAutoscrollDirection::Down => {
+                if metrics.offset_from_bottom == 0 {
+                    self.stop_selection_autoscroll();
+                    return;
+                }
+                if let Some(pty) = self.pty.as_ref() {
+                    pty.runtime.scroll_down(1);
+                }
+            }
+        }
+        let metrics = self
+            .pty
+            .as_ref()
+            .and_then(|pty| pty.runtime.scroll_metrics());
+        if let Some(selection) = self.selection.as_mut() {
+            selection.drag(
+                autoscroll.last_mouse_screen_col,
+                autoscroll.last_mouse_screen_row,
+                terminal_rect,
+                metrics,
+            );
+        }
+        self.selection_autoscroll_deadline = Some(now + SELECTION_AUTOSCROLL_INTERVAL);
+    }
+
     fn attach(&mut self, session: SessionItem, area: Rect) {
         /*
         CDXC:GhostexTui 2026-05-26-13:03:
@@ -457,6 +557,7 @@ impl App {
         match PtySession::spawn(&session, area) {
             Ok(pty) => {
                 self.pty = Some(pty);
+                self.clear_selection();
                 self.status.clear();
                 self.active_session = Some(session);
                 self.mode = Mode::Attached;
@@ -688,19 +789,57 @@ impl App {
     }
 }
 
-struct TerminalGuard;
+struct TerminalGuard {
+    reset_modify_other_keys: bool,
+}
 
 impl TerminalGuard {
     fn enter() -> io::Result<Self> {
         enable_raw_mode()?;
-        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
-        Ok(Self)
+        execute!(
+            io::stdout(),
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            EnableBracketedPaste,
+            EnableFocusChange,
+            PushKeyboardEnhancementFlags(input::ime_compatible_keyboard_enhancement_flags())
+        )?;
+        /*
+        CDXC:GhostexTui 2026-06-07-16:34:
+        Shift+Enter in attached Ghostex TUI sessions must reach agent CLIs as
+        LF/Ctrl+J. Match Herdr's host keyboard negotiation so terminals that do
+        not report modified Enter through Kitty flags still expose it through
+        xterm modifyOtherKeys where Herdr already knows the host is parseable.
+        */
+        let modify_other_keys_mode = input::host_modify_other_keys_mode(
+            std::env::var("TMUX").is_ok(),
+            std::env::var("TERM_PROGRAM").ok().as_deref(),
+            std::env::var_os("WEZTERM_PANE").is_some(),
+        );
+        if let Some(mode) = modify_other_keys_mode {
+            io::stdout().write_all(mode.set_sequence())?;
+            io::stdout().flush()?;
+        }
+        Ok(Self {
+            reset_modify_other_keys: modify_other_keys_mode.is_some(),
+        })
     }
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+        if self.reset_modify_other_keys {
+            let _ = io::stdout().write_all(b"\x1b[>4;0m");
+            let _ = io::stdout().flush();
+        }
+        let _ = execute!(
+            io::stdout(),
+            PopKeyboardEnhancementFlags,
+            DisableFocusChange,
+            DisableBracketedPaste,
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        );
         let _ = disable_raw_mode();
     }
 }
@@ -722,6 +861,7 @@ async fn main() -> io::Result<()> {
             pty.drain_output();
         }
         app.maybe_refresh_sessions();
+        app.tick_selection_autoscroll(Instant::now(), terminal_rect);
         terminal.draw(|frame| render(frame, &mut app))?;
 
         if event::poll(POLL_INTERVAL)? {
@@ -737,6 +877,7 @@ async fn main() -> io::Result<()> {
                     }
                 }
                 Event::Resize(_, _) => {}
+                Event::Paste(text) => handle_paste(&mut app, text).await,
                 _ => {}
             }
         }
@@ -778,9 +919,9 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
     and desktop users can distinguish Ghostex controls from session output.
 
     CDXC:GhostexTui 2026-05-25-17:38:
-    The header title may wrap onto the second content row while activity counts
-    stay below it on the right. Keep the switch affordance two rows tall and
-    label it as "switch session" with one word per row.
+    The header title may wrap onto the second content row. Keep the switch
+    affordance two rows tall and label it as "switch session" with one word per
+    row.
 
     CDXC:GhostexTui 2026-05-25-17:48:
     When the user is already on the switcher, the top-right control should
@@ -789,8 +930,7 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
 
     CDXC:GhostexTui 2026-05-25-17:58:
     The switcher quit label should keep "Quit" on the first row and "GTX TUI"
-    on the second row, while attached activity counters reserve one trailing
-    space before the switch button so the attention count does not touch it.
+    on the second row.
 
     CDXC:GhostexTui 2026-05-25-18:37:
     The TUI title bar sits at the bottom of the screen, so its separator must
@@ -804,15 +944,19 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
     controls.
 
     CDXC:GhostexTui 2026-05-26-03:39:
-    Attached-view working/attention totals belong on the second content line,
-    right-aligned with exactly one column of margin before the switch control.
+    Attached-view working/attention totals should remain compact dot counters;
+    the 2026-06-07 badge requirement owns their left-side placement.
+
+    CDXC:GhostexTui 2026-06-07-15:47:
+    Attached terminal chrome needs a fixed 9-column, two-row project badge on
+    the left, mirroring the switch control on the right. Replace the Ghostex
+    brand with the first seven display columns of the active project name and
+    put the activity totals directly below it so the center title remains only
+    session context.
     */
     let header_style = Style::default().bg(Color::Rgb(24, 24, 37));
     frame.render_widget(Clear, area);
     frame.render_widget(Paragraph::new("").style(header_style), area);
-    let switch_width = 12u16.min(area.width);
-    let status_width = area.width.saturating_sub(switch_width);
-    let status = Rect::new(area.x, area.y, status_width, area.height);
     let switch = switch_button_rect(area);
     if app.mode == Mode::Switcher {
         frame.render_widget(
@@ -833,33 +977,6 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
         .as_ref()
         .map(|session| session.title.as_str())
         .unwrap_or("No session");
-    let count_right_margin = 1u16;
-    let count_width = if app.mode == Mode::Attached {
-        activity_count_width(
-            app.activity_count(SessionActivity::Working),
-            app.activity_count(SessionActivity::Attention),
-        )
-        .min(status_width.saturating_sub(count_right_margin))
-    } else {
-        0
-    };
-    let title_width = status_width
-        .saturating_sub(count_width.saturating_add(count_right_margin))
-        .max(status_width.min(1));
-    let title_spans = vec![
-        Span::styled(
-            " Ghostex ",
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Rgb(137, 180, 250))
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" "),
-        Span::styled(
-            title.to_string(),
-            header_style.fg(Color::White).add_modifier(Modifier::BOLD),
-        ),
-    ];
     if app.mode == Mode::Attached {
         /*
         CDXC:GhostexTui 2026-05-25-17:23:
@@ -867,31 +984,47 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
         the literal words "working" or "attention"; the dot colors carry the
         same meaning as the macOS sidebar indicators.
         */
-        let counts = activity_count_spans(
-            app.activity_count(SessionActivity::Working),
-            app.activity_count(SessionActivity::Attention),
-        );
-        frame.render_widget(
-            Paragraph::new(Line::from(counts))
+        let project_badge = project_badge_rect(area);
+        if project_badge.height > 0 {
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    project_badge_label(app.active_session.as_ref()),
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Rgb(137, 180, 250))
+                        .add_modifier(Modifier::BOLD),
+                ))),
+                Rect::new(project_badge.x, project_badge.y, project_badge.width, 1),
+            );
+        }
+        if project_badge.height > 1 {
+            frame.render_widget(
+                Paragraph::new(Line::from(activity_count_badge_spans(
+                    app.activity_count(SessionActivity::Working),
+                    app.activity_count(SessionActivity::Attention),
+                    Color::Rgb(24, 24, 37),
+                )))
                 .style(header_style)
-                .alignment(Alignment::Right),
-            Rect::new(
-                status.x
-                    + status_width.saturating_sub(count_width.saturating_add(count_right_margin)),
-                status.y + 2,
-                count_width,
-                1,
-            ),
-        );
-    }
-    if app.mode == Mode::Attached {
+                .alignment(Alignment::Center),
+                Rect::new(project_badge.x, project_badge.y + 1, project_badge.width, 1),
+            );
+        }
+        let title_gap = u16::from(project_badge.width > 0);
+        let title_x = area
+            .x
+            .saturating_add(project_badge.width)
+            .saturating_add(title_gap);
+        let title_width = switch.x.saturating_sub(title_x);
         frame.render_widget(
-            Paragraph::new(Line::from(title_spans))
-                .style(header_style)
-                .wrap(Wrap { trim: false }),
+            Paragraph::new(Line::from(Span::styled(
+                title.to_string(),
+                header_style.fg(Color::White).add_modifier(Modifier::BOLD),
+            )))
+            .style(header_style)
+            .wrap(Wrap { trim: false }),
             Rect::new(
-                status.x,
-                status.y + 1,
+                title_x,
+                area.y + 1,
                 title_width,
                 area.height.saturating_sub(1),
             ),
@@ -910,7 +1043,7 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
         )
         .alignment(Alignment::Center)
         .block(Block::default().borders(Borders::LEFT)),
-        Rect::new(switch.x, switch.y + 1, switch.width, switch.height),
+        switch,
     );
     if area.height > 0 {
         frame.render_widget(
@@ -927,11 +1060,42 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
 fn render_terminal(frame: &mut Frame, app: &mut App, area: Rect) {
     if let Some(pty) = app.pty.as_ref() {
         pty.runtime.render(frame, area, true);
+        render_terminal_selection(frame, app, pty, area);
     } else {
         frame.render_widget(
             Paragraph::new(app.status.as_str()).style(Style::default().fg(Color::Red)),
             area,
         );
+    }
+}
+
+fn render_terminal_selection(frame: &mut Frame, app: &App, pty: &PtySession, area: Rect) {
+    /*
+     * CDXC:GhostexTui 2026-06-07-16:19:
+     * Attached Ghostex TUI sessions need host-side text selection because the
+     * wrapper owns mouse capture while rendering a single Ghostty-backed PTY.
+     * Highlight selected viewport cells after terminal rendering so selection
+     * is visible without changing the child process output.
+     */
+    let Some(selection) = app.selection.as_ref() else {
+        return;
+    };
+    if !selection.is_visible() || selection.pane_id != pty.pane_id {
+        return;
+    }
+    let metrics = pty.runtime.scroll_metrics();
+    let buf = frame.buffer_mut();
+    for y in 0..area.height {
+        for x in 0..area.width {
+            if selection.contains(y, x, metrics) {
+                let cell = &mut buf[(area.x + x, area.y + y)];
+                cell.set_style(
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Rgb(137, 180, 250)),
+                );
+            }
+        }
     }
 }
 
@@ -942,26 +1106,32 @@ fn activity_dot_span(session: &SessionItem, bg: Color) -> Span<'static> {
     }
 }
 
-fn activity_count_spans(working_count: usize, attention_count: usize) -> Vec<Span<'static>> {
+fn activity_count_badge_spans(
+    working_count: usize,
+    attention_count: usize,
+    bg: Color,
+) -> Vec<Span<'static>> {
+    let working_count = compact_activity_count(working_count);
+    let attention_count = compact_activity_count(attention_count);
+    let spaced = format!("● {working_count} ● {attention_count}");
+    let count_gap = if spaced.chars().count() <= HEADER_CONTROL_WIDTH as usize {
+        " "
+    } else {
+        ""
+    };
     vec![
-        Span::styled("●", Style::default().fg(WORKING_COLOR)),
-        Span::styled(
-            format!(" {working_count}"),
-            Style::default().fg(Color::White),
-        ),
-        Span::raw("  "),
-        Span::styled("●", Style::default().fg(ATTENTION_COLOR)),
-        Span::styled(
-            format!(" {attention_count}"),
-            Style::default().fg(Color::White),
-        ),
+        Span::styled("●", Style::default().fg(WORKING_COLOR).bg(bg)),
+        Span::raw(count_gap),
+        Span::styled(working_count, Style::default().fg(Color::White).bg(bg)),
+        Span::raw(" "),
+        Span::styled("●", Style::default().fg(ATTENTION_COLOR).bg(bg)),
+        Span::raw(count_gap),
+        Span::styled(attention_count, Style::default().fg(Color::White).bg(bg)),
     ]
 }
 
-fn activity_count_width(working_count: usize, attention_count: usize) -> u16 {
-    format!("● {working_count}  ● {attention_count}")
-        .chars()
-        .count() as u16
+fn compact_activity_count(count: usize) -> String {
+    count.min(999).to_string()
 }
 
 fn activity_color(activity: SessionActivity) -> Color {
@@ -1052,13 +1222,14 @@ fn emit_terminal_bell() {
 
 fn render_switcher(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(Clear, area);
-    app.keep_selected_visible(area);
+    let content = switcher_content_rect(area);
+    app.keep_selected_visible(content);
     let visible_rows = app
         .rows
         .iter()
         .enumerate()
         .skip(app.switch_scroll)
-        .take(area.height as usize)
+        .take(content.height as usize)
         .map(|(idx, row)| match row {
             SwitchRow::Project(project) => {
                 let selected = idx == app.selected_row_index;
@@ -1306,6 +1477,7 @@ fn handle_key(app: &mut App, key: KeyEvent, terminal_rect: Rect) -> bool {
     }
     if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('k')) {
         if app.mode == Mode::Attached {
+            app.clear_selection();
             if let Some(session) = app.active_session.clone() {
                 app.context_menu = Some(ContextMenu {
                     title: session.title.clone(),
@@ -1334,16 +1506,39 @@ fn handle_key(app: &mut App, key: KeyEvent, terminal_rect: Rect) -> bool {
             if key.modifiers.contains(KeyModifiers::CONTROL)
                 && matches!(key.code, KeyCode::Char('s'))
             {
+                app.clear_selection();
                 app.mode = Mode::Switcher;
                 app.refresh_sessions(false);
                 return false;
             }
+            app.clear_selection();
             if let Some(pty) = app.pty.as_mut() {
                 pty.write_key(key);
             }
         }
     }
     false
+}
+
+async fn handle_paste(app: &mut App, text: String) {
+    /*
+     * CDXC:GhostexTui 2026-06-07-16:47:
+     * Enabling Herdr's keyboard protocol setup also enables bracketed paste on
+     * the host terminal. Forward paste events through the attached runtime so
+     * child shells and agent CLIs keep receiving normal or bracketed paste
+     * payloads according to their own terminal mode.
+     */
+    if let Some(prompt) = app.input_prompt.as_mut() {
+        prompt.value.push_str(&text);
+        return;
+    }
+    if app.show_hotkeys || app.context_menu.is_some() || app.mode != Mode::Attached {
+        return;
+    }
+    app.clear_selection();
+    if let Some(pty) = app.pty.as_mut() {
+        pty.send_paste(text).await;
+    }
 }
 
 fn handle_context_menu_key(app: &mut App, key: KeyEvent, terminal_rect: Rect) -> bool {
@@ -1415,13 +1610,18 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, full: Rect, terminal_rect: Rec
                     mouse.row,
                 )
             {
+                app.clear_selection();
                 app.mode = Mode::Switcher;
                 app.refresh_sessions(false);
             }
-            if rect_contains(terminal_rect, mouse.column, mouse.row) {
-                if let Some(pty) = app.pty.as_mut() {
-                    pty.handle_mouse(mouse, terminal_rect);
-                }
+            let terminal_mouse_event = rect_contains(terminal_rect, mouse.column, mouse.row);
+            let selection_drag_event = app.selection.is_some()
+                && matches!(
+                    mouse.kind,
+                    MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left)
+                );
+            if terminal_mouse_event || selection_drag_event {
+                handle_attached_terminal_mouse(app, mouse, terminal_rect);
             }
         }
         Mode::Switcher => match mouse.kind {
@@ -1446,12 +1646,11 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, full: Rect, terminal_rect: Rec
             MouseEventKind::ScrollUp => app.select_delta(-(MOUSE_SCROLL_LINES as isize)),
             MouseEventKind::ScrollDown => app.select_delta(MOUSE_SCROLL_LINES as isize),
             MouseEventKind::Down(MouseButton::Left) => {
-                if !rect_contains(terminal_rect, mouse.column, mouse.row) {
+                let Some(doc_y) =
+                    switcher_document_y_for_mouse(mouse, terminal_rect, app.switch_scroll)
+                else {
                     return false;
-                }
-                let doc_y = app
-                    .switch_scroll
-                    .saturating_add(mouse.row.saturating_sub(terminal_rect.y) as usize);
+                };
                 if app.select_row_at_document_y(doc_y).is_some() {
                     handle_switch_action(app, terminal_rect);
                 }
@@ -1460,6 +1659,117 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, full: Rect, terminal_rect: Rec
         },
     }
     false
+}
+
+fn handle_attached_terminal_mouse(app: &mut App, mouse: MouseEvent, terminal_rect: Rect) {
+    /*
+     * CDXC:GhostexTui 2026-06-07-16:19:
+     * Host-side text selection should start when the attached child has not
+     * enabled mouse reporting. Preserve terminal-app mouse behavior by
+     * forwarding reported mouse events first, then falling back to selection
+     * anchor/drag/copy for ordinary shell and agent output.
+     */
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            app.clear_selection();
+            let forwarded = app
+                .pty
+                .as_mut()
+                .is_some_and(|pty| pty.forward_mouse_button(mouse, terminal_rect));
+            if !forwarded {
+                start_attached_terminal_selection(app, mouse, terminal_rect);
+            }
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if app.selection.is_some() {
+                drag_attached_terminal_selection(app, mouse, terminal_rect);
+            } else if let Some(pty) = app.pty.as_mut() {
+                pty.forward_mouse_button(mouse, terminal_rect);
+            }
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            if app.selection.is_some() {
+                finish_attached_terminal_selection(app);
+            } else if let Some(pty) = app.pty.as_mut() {
+                pty.forward_mouse_button(mouse, terminal_rect);
+            }
+        }
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            if app
+                .selection
+                .as_ref()
+                .is_some_and(|selection| !selection.is_in_progress())
+            {
+                app.clear_selection();
+            }
+            if let Some(pty) = app.pty.as_mut() {
+                pty.handle_wheel(mouse, terminal_rect);
+            }
+        }
+        _ => {
+            app.clear_selection();
+            if let Some(pty) = app.pty.as_mut() {
+                pty.forward_mouse_button(mouse, terminal_rect);
+            }
+        }
+    }
+}
+
+fn start_attached_terminal_selection(app: &mut App, mouse: MouseEvent, terminal_rect: Rect) {
+    let Some(pty) = app.pty.as_ref() else {
+        return;
+    };
+    let pane_id = pty.pane_id;
+    let metrics = pty.runtime.scroll_metrics();
+    app.stop_selection_autoscroll();
+    app.selection = Some(attached_terminal_selection_anchor(
+        mouse,
+        terminal_rect,
+        pane_id,
+        metrics,
+    ));
+}
+
+fn drag_attached_terminal_selection(app: &mut App, mouse: MouseEvent, terminal_rect: Rect) {
+    let Some(selection) = app.selection.as_ref() else {
+        return;
+    };
+    let metrics = app
+        .pty
+        .as_ref()
+        .and_then(|pty| pty.runtime.scroll_metrics());
+    let (screen_col, screen_row) = attached_terminal_selection_screen_pos(mouse);
+    let was_dragging = selection.is_dragging();
+    let (anchor_screen_row, anchor_screen_col) =
+        selection.anchor_screen_pos(terminal_rect, metrics);
+    let anchor_differs_from_mouse =
+        anchor_screen_row != screen_row || anchor_screen_col != screen_col;
+    let is_dragging = was_dragging || anchor_differs_from_mouse;
+    if let Some(selection) = app.selection.as_mut() {
+        drag_attached_terminal_selection_with_metrics(selection, mouse, terminal_rect, metrics);
+        if is_dragging && selection.is_just_click() {
+            selection.force_dragging();
+        }
+    }
+    update_attached_selection_autoscroll(app, screen_col, screen_row, terminal_rect, is_dragging);
+}
+
+fn finish_attached_terminal_selection(app: &mut App) {
+    app.stop_selection_autoscroll();
+    let Some(selection) = app.selection.as_mut() else {
+        return;
+    };
+    if !selection.finish() {
+        app.clear_selection();
+        return;
+    }
+    let text = app
+        .pty
+        .as_ref()
+        .and_then(|pty| pty.runtime.extract_selection(selection));
+    if let Some(text) = text.filter(|text| !text.is_empty()) {
+        selection::write_osc52_bytes(text.as_bytes());
+    }
 }
 
 fn handle_switch_action(app: &mut App, terminal_rect: Rect) {
@@ -1989,29 +2299,185 @@ fn terminal_area(full: Rect) -> Rect {
     )
 }
 
+fn switcher_content_rect(area: Rect) -> Rect {
+    Rect::new(
+        area.x.saturating_add(1),
+        area.y.saturating_add(1),
+        area.width.saturating_sub(2),
+        area.height.saturating_sub(2),
+    )
+}
+
+fn switcher_document_y_for_mouse(
+    mouse: MouseEvent,
+    switcher_area: Rect,
+    switch_scroll: usize,
+) -> Option<usize> {
+    /*
+     * CDXC:GhostexTui 2026-06-07-16:40:
+     * Switcher clicks target rows inside the bordered list, not the outer
+     * terminal area. Subtract the block's top border during hit testing so a
+     * click lands on the visible row under the pointer instead of the next row.
+     */
+    let content = switcher_content_rect(switcher_area);
+    if !rect_contains(content, mouse.column, mouse.row) {
+        return None;
+    }
+    Some(switch_scroll.saturating_add(mouse.row.saturating_sub(content.y) as usize))
+}
+
+fn attached_terminal_mouse_cell(mouse: MouseEvent, terminal_rect: Rect) -> (u16, u16) {
+    /*
+     * CDXC:GhostexTui 2026-06-07-15:56:
+     * Attached Ghostex TUI mouse events arrive one screen row lower than the
+     * Ghostty viewport row the user clicked. Normalize the row before Ghostty's
+     * mouse encoder adds the terminal protocol's one-based SGR offset so clicks
+     * and reported wheel events land on the rendered terminal cell.
+     */
+    (
+        mouse.column.saturating_sub(terminal_rect.x),
+        mouse.row.saturating_sub(terminal_rect.y.saturating_add(1)),
+    )
+}
+
+fn attached_terminal_selection_cell(mouse: MouseEvent, terminal_rect: Rect) -> (u16, u16) {
+    /*
+     * CDXC:GhostexTui 2026-06-07-16:39:
+     * Host-side selection highlights the rendered Ghostex TUI viewport, while
+     * child-terminal mouse reporting uses attached_terminal_mouse_cell's row
+     * normalization. Keep selection on raw screen rows so the highlight stays
+     * on the line under the user's pointer.
+     */
+    (
+        mouse.column.saturating_sub(terminal_rect.x),
+        mouse.row.saturating_sub(terminal_rect.y),
+    )
+}
+
+fn attached_terminal_selection_anchor(
+    mouse: MouseEvent,
+    terminal_rect: Rect,
+    pane_id: layout::PaneId,
+    metrics: Option<pane::ScrollMetrics>,
+) -> selection::Selection {
+    let (column, row) = attached_terminal_selection_cell(mouse, terminal_rect);
+    selection::Selection::anchor(pane_id, row, column, metrics)
+}
+
+fn drag_attached_terminal_selection_with_metrics(
+    selection: &mut selection::Selection,
+    mouse: MouseEvent,
+    terminal_rect: Rect,
+    metrics: Option<pane::ScrollMetrics>,
+) {
+    let (screen_col, screen_row) = attached_terminal_selection_screen_pos(mouse);
+    selection.drag(screen_col, screen_row, terminal_rect, metrics);
+}
+
+fn attached_terminal_selection_screen_pos(mouse: MouseEvent) -> (u16, u16) {
+    (mouse.column, mouse.row)
+}
+
+fn update_attached_selection_autoscroll(
+    app: &mut App,
+    screen_col: u16,
+    screen_row: u16,
+    terminal_rect: Rect,
+    is_dragging: bool,
+) {
+    /*
+     * CDXC:GhostexTui 2026-06-07-16:41:
+     * Attached terminal selection should auto-scroll like Herdr when the user
+     * drags to the top or bottom edge. Store the last screen position and let
+     * the render loop extend the selection while the pointer remains at an
+     * edge, stopping at scrollback boundaries.
+     */
+    if !is_dragging || terminal_rect.height == 0 {
+        app.stop_selection_autoscroll();
+        return;
+    }
+    let top = terminal_rect.y;
+    let bottom = terminal_rect
+        .y
+        .saturating_add(terminal_rect.height.saturating_sub(1));
+    let direction = if screen_row <= top {
+        Some(AttachedSelectionAutoscrollDirection::Up)
+    } else if screen_row >= bottom {
+        Some(AttachedSelectionAutoscrollDirection::Down)
+    } else {
+        None
+    };
+    let Some(direction) = direction else {
+        app.stop_selection_autoscroll();
+        return;
+    };
+    app.selection_autoscroll = Some(AttachedSelectionAutoscroll {
+        direction,
+        last_mouse_screen_col: screen_col,
+        last_mouse_screen_row: screen_row,
+        terminal_rect,
+    });
+    if app.selection_autoscroll_deadline.is_none() {
+        app.selection_autoscroll_deadline = Some(Instant::now() + SELECTION_AUTOSCROLL_INTERVAL);
+    }
+}
+
+fn attached_terminal_key_override_bytes(key: KeyEvent) -> Option<Vec<u8>> {
+    /*
+     * CDXC:GhostexTui 2026-06-07-15:57:
+     * Attached Ghostex TUI sessions should treat Shift+Enter as Ctrl+J.
+     * Send LF directly instead of preserving modified Enter through Kitty/CSI-u
+     * negotiation so agents and shells receive the same input as Ctrl+J.
+     */
+    let is_shift_enter = key.code == KeyCode::Enter
+        && key.modifiers.contains(KeyModifiers::SHIFT)
+        && !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+    let is_ctrl_j = matches!(key.code, KeyCode::Char('j'))
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key.modifiers.intersects(KeyModifiers::ALT);
+    if !is_shift_enter && !is_ctrl_j {
+        return None;
+    }
+    match key.kind {
+        crossterm::event::KeyEventKind::Press | crossterm::event::KeyEventKind::Repeat => {
+            Some(vec![b'\n'])
+        }
+        crossterm::event::KeyEventKind::Release => Some(Vec::new()),
+    }
+}
+
 fn rect_from_size(size: ratatui::layout::Size) -> Rect {
     Rect::new(0, 0, size.width, size.height)
 }
 
 fn switch_button_rect(header: Rect) -> Rect {
-    let width = 12u16.min(header.width);
-    Rect::new(
-        header.x + header.width.saturating_sub(width),
-        header.y,
-        width,
-        header.height.min(2),
-    )
+    let width = HEADER_CONTROL_WIDTH.min(header.width);
+    header_control_rect(header, header.x + header.width.saturating_sub(width), width)
 }
 
 fn hotkeys_button_rect(header: Rect) -> Rect {
-    let switch_width = 12u16.min(header.width);
+    let switch_width = HEADER_CONTROL_WIDTH.min(header.width);
     let available_width = header.width.saturating_sub(switch_width);
     let width = 14u16.min(available_width);
+    header_control_rect(header, header.x, width)
+}
+
+fn project_badge_rect(header: Rect) -> Rect {
+    let switch_width = HEADER_CONTROL_WIDTH.min(header.width);
+    let available_width = header.width.saturating_sub(switch_width);
+    let width = HEADER_CONTROL_WIDTH.min(available_width);
+    header_control_rect(header, header.x, width)
+}
+
+fn header_control_rect(header: Rect, x: u16, width: u16) -> Rect {
+    let height = header.height.saturating_sub(1).min(2);
     Rect::new(
-        header.x,
-        header.y + 1,
+        x,
+        header.y + header.height.saturating_sub(height),
         width,
-        header.height.saturating_sub(1).min(2),
+        height,
     )
 }
 
@@ -2043,6 +2509,34 @@ fn project_label(session: &SessionItem) -> String {
         .or(session.project_path.as_deref())
         .unwrap_or("Project")
         .to_string()
+}
+
+fn project_badge_label(session: Option<&SessionItem>) -> String {
+    let label = session
+        .map(project_label)
+        .unwrap_or_else(|| "Project".to_string());
+    format!(
+        " {} ",
+        fixed_display_prefix(&label, HEADER_PROJECT_LABEL_WIDTH)
+    )
+}
+
+fn fixed_display_prefix(text: &str, width: usize) -> String {
+    let mut output = String::new();
+    let mut used_width = 0usize;
+    for ch in text.trim().chars().filter(|ch| !ch.is_control()) {
+        let char_width = ch.width().unwrap_or(0);
+        if used_width + char_width > width {
+            break;
+        }
+        output.push(ch);
+        used_width += char_width;
+    }
+    while used_width < width {
+        output.push(' ');
+        used_width += 1;
+    }
+    output
 }
 
 fn agent_indicator(session: &SessionItem) -> &'static str {
@@ -2121,6 +2615,9 @@ mod tests {
             input_prompt: None,
             show_hotkeys: false,
             pty: None,
+            selection: None,
+            selection_autoscroll: None,
+            selection_autoscroll_deadline: None,
             mode: Mode::Switcher,
             switch_scroll: 0,
             last_refresh: Instant::now(),
@@ -2128,6 +2625,12 @@ mod tests {
             has_loaded_session_statuses: true,
             status: String::new(),
         }
+    }
+
+    fn buffer_row_text(buffer: &ratatui::buffer::Buffer, row: u16, width: u16) -> String {
+        (0..width)
+            .map(|x| buffer[(x, row)].symbol())
+            .collect::<String>()
     }
 
     #[test]
@@ -2209,6 +2712,190 @@ mod tests {
 
         assert_eq!(app.activity_count(SessionActivity::Working), 1);
         assert_eq!(app.activity_count(SessionActivity::Attention), 1);
+    }
+
+    #[test]
+    fn header_controls_use_nine_column_bottom_two_row_rects() {
+        let header = Rect::new(2, 10, 50, 3);
+
+        assert_eq!(project_badge_rect(header), Rect::new(2, 11, 9, 2));
+        assert_eq!(switch_button_rect(header), Rect::new(43, 11, 9, 2));
+        assert_eq!(hotkeys_button_rect(header), Rect::new(2, 11, 14, 2));
+    }
+
+    #[test]
+    fn attached_terminal_mouse_cell_removes_attached_row_offset() {
+        let terminal = Rect::new(4, 6, 80, 20);
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 14,
+            row: 8,
+            modifiers: KeyModifiers::empty(),
+        };
+
+        assert_eq!(attached_terminal_mouse_cell(mouse, terminal), (10, 1));
+
+        let top_row_mouse = MouseEvent { row: 6, ..mouse };
+        assert_eq!(
+            attached_terminal_mouse_cell(top_row_mouse, terminal),
+            (10, 0)
+        );
+    }
+
+    #[test]
+    fn switcher_document_y_uses_bordered_list_inner_row() {
+        let switcher = Rect::new(0, 0, 80, 10);
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 4,
+            row: 3,
+            modifiers: KeyModifiers::empty(),
+        };
+
+        assert_eq!(switcher_document_y_for_mouse(mouse, switcher, 10), Some(12));
+
+        let top_border = MouseEvent { row: 0, ..mouse };
+        assert_eq!(
+            switcher_document_y_for_mouse(top_border, switcher, 10),
+            None
+        );
+    }
+
+    #[test]
+    fn attached_terminal_selection_uses_rendered_screen_rows() {
+        let terminal = Rect::new(4, 6, 80, 20);
+        let pane_id = layout::PaneId::from_raw(42);
+        let anchor = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 14,
+            row: 8,
+            modifiers: KeyModifiers::empty(),
+        };
+        let mut selection = attached_terminal_selection_anchor(anchor, terminal, pane_id, None);
+
+        assert!(!selection.is_visible());
+
+        let drag = MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 16,
+            row: 10,
+            modifiers: KeyModifiers::empty(),
+        };
+        drag_attached_terminal_selection_with_metrics(&mut selection, drag, terminal, None);
+
+        assert!(selection.is_visible());
+        assert!(selection.contains(2, 10, None));
+        assert!(selection.contains(4, 12, None));
+        assert!(!selection.contains(5, 12, None));
+    }
+
+    #[test]
+    fn attached_selection_autoscroll_arms_on_terminal_edges() {
+        let mut app = test_app(Vec::new());
+        let terminal = Rect::new(0, 2, 80, 10);
+
+        update_attached_selection_autoscroll(&mut app, 8, 2, terminal, true);
+
+        assert_eq!(
+            app.selection_autoscroll.map(|state| state.direction),
+            Some(AttachedSelectionAutoscrollDirection::Up)
+        );
+
+        update_attached_selection_autoscroll(&mut app, 8, 6, terminal, true);
+        assert!(app.selection_autoscroll.is_none());
+
+        update_attached_selection_autoscroll(&mut app, 8, 11, terminal, true);
+        assert_eq!(
+            app.selection_autoscroll.map(|state| state.direction),
+            Some(AttachedSelectionAutoscrollDirection::Down)
+        );
+    }
+
+    #[test]
+    fn attached_terminal_shift_enter_sends_ctrl_j_bytes() {
+        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT);
+
+        assert_eq!(attached_terminal_key_override_bytes(key), Some(vec![b'\n']));
+    }
+
+    #[test]
+    fn attached_terminal_shift_enter_release_sends_no_bytes() {
+        let key = KeyEvent::new_with_kind(
+            KeyCode::Enter,
+            KeyModifiers::SHIFT,
+            crossterm::event::KeyEventKind::Release,
+        );
+
+        assert_eq!(attached_terminal_key_override_bytes(key), Some(Vec::new()));
+    }
+
+    #[test]
+    fn attached_terminal_plain_enter_uses_runtime_encoder() {
+        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::empty());
+
+        assert_eq!(attached_terminal_key_override_bytes(key), None);
+    }
+
+    #[test]
+    fn attached_terminal_ctrl_j_sends_lf_bytes() {
+        let key = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL);
+
+        assert_eq!(attached_terminal_key_override_bytes(key), Some(vec![b'\n']));
+    }
+
+    #[test]
+    fn project_badge_label_uses_first_seven_project_columns() {
+        let mut session = test_session("alpha", "one");
+        session.project_name = Some("ZmuxProject".to_string());
+
+        assert_eq!(project_badge_label(Some(&session)), " ZmuxPro ");
+    }
+
+    #[test]
+    fn activity_count_badge_stays_inside_nine_columns() {
+        let text = activity_count_badge_spans(999, 999, Color::Reset)
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert_eq!(text, "●999 ●999");
+        assert!(text.chars().count() <= HEADER_CONTROL_WIDTH as usize);
+    }
+
+    #[test]
+    fn attached_header_renders_project_badge_counts_and_session_title() {
+        let active = SessionItem {
+            activity: Some("working".to_string()),
+            project_name: Some("ZmuxProject".to_string()),
+            title: "Terminal".to_string(),
+            ..test_session("alpha", "one")
+        };
+        let attention = SessionItem {
+            activity: Some("attention".to_string()),
+            ..test_session("alpha", "attention")
+        };
+        let mut app = test_app(vec![ProjectGroup {
+            project_id: Some("alpha".to_string()),
+            group_id: Some("alpha-group".to_string()),
+            name: "ZmuxProject".to_string(),
+            path: Some("/alpha".to_string()),
+            sessions: vec![active.clone(), attention],
+        }]);
+        app.mode = Mode::Attached;
+        app.active_session = Some(active);
+
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(48, 3)).unwrap();
+        terminal
+            .draw(|frame| render_header(frame, &app, Rect::new(0, 0, 48, 3)))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+
+        assert_eq!(buffer_row_text(buffer, 1, 9), " ZmuxPro ");
+        assert_eq!(buffer_row_text(buffer, 2, 9), " ● 1 ● 1 ");
+        let title_row = buffer_row_text(buffer, 1, 48);
+        assert!(title_row.contains("Terminal"));
+        assert!(!title_row.contains("Ghostex"));
     }
 
     #[test]
