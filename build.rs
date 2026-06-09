@@ -69,6 +69,13 @@ fn main() {
         command.arg("--system").arg(system_dir);
     }
 
+    /*
+    CDXC:TuiPackaging 2026-06-09-23:52:
+    Ghostex macOS releases build arm64 and x86_64 binaries in sequence, so the vendored libghostty-vt archive must be emitted into a target-specific prefix. Sharing zig-out lets the second Cargo target link the first target's archive.
+    */
+    let zig_prefix = vendored_dir.join("zig-out").join(&target);
+    command.arg("--prefix").arg(&zig_prefix);
+
     let status = command
         .current_dir(&vendored_dir)
         .status()
@@ -78,7 +85,7 @@ fn main() {
         "zig build for vendored libghostty-vt failed: {status}"
     );
 
-    let lib_dir = vendored_dir.join("zig-out/lib");
+    let lib_dir = zig_prefix.join("lib");
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
     if target.contains("apple-darwin") {
         let static_lib = lib_dir.join("libghostty-vt.a");
