@@ -38,6 +38,23 @@ const GHOSTEX_TUI_TERM: &str = "xterm-256color";
 const GHOSTEX_TUI_COLORTERM: &str = "truecolor";
 const HEADER_CONTROL_WIDTH: u16 = 9;
 const HEADER_PROJECT_LABEL_WIDTH: usize = 7;
+/*
+CDXC:GhostexTuiColors 2026-06-09-09:59:
+Ghostex TUI backgrounds should read as neutral gray/cool gray rather than purple, with blue reserved for active accents, borders, and badges.
+Keep the wrapper palette local and semantic so switcher, header, menu, and overlay surfaces stay visually consistent.
+*/
+const TUI_BG: Color = Color::Rgb(22, 24, 28);
+const TUI_SURFACE: Color = Color::Rgb(34, 39, 46);
+const TUI_SELECTED_BG: Color = Color::Rgb(45, 54, 64);
+const TUI_RULE: Color = Color::Rgb(70, 82, 96);
+const TUI_ACCENT_BLUE: Color = Color::Rgb(88, 166, 255);
+const TUI_TEXT: Color = Color::Rgb(230, 237, 243);
+const TUI_SUBTLE_TEXT: Color = Color::Rgb(139, 148, 158);
+const TUI_DANGER: Color = Color::Rgb(255, 123, 114);
+const TUI_AGENT_CLAUDE_ORANGE: Color = Color::Rgb(255, 136, 76);
+const TUI_AGENT_PERIWINKLE: Color = Color::Rgb(139, 154, 255);
+const TUI_AGENT_OPENCODE_BLUE: Color = Color::Rgb(126, 166, 203);
+const TUI_AGENT_FACTORY_ORANGE: Color = Color::Rgb(255, 136, 36);
 const WORKING_COLOR: Color = Color::Rgb(248, 173, 7);
 const ATTENTION_COLOR: Color = Color::Rgb(115, 231, 156);
 
@@ -545,7 +562,7 @@ impl App {
     fn attach(&mut self, session: SessionItem, area: Rect) {
         /*
         CDXC:GhostexTui 2026-05-26-13:03:
-        Attaching to an attention session from GTX TUI means the user has seen
+        Attaching to an attention session from Ghostex TUI means the user has seen
         that shared attention event. Acknowledge through the Ghostex CLI bridge
         so the desktop sidebar and any other TUI clients clear the same event.
         */
@@ -923,13 +940,13 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
     affordance two rows tall and label it as "switch session" with one word per
     row.
 
-    CDXC:GhostexTui 2026-05-25-17:48:
+    CDXC:GhostexTui 2026-06-09-09:22:
     When the user is already on the switcher, the top-right control should
-    become the exit affordance and read "Quit GTX TUI" instead of offering to
-    switch sessions again.
+    become the exit affordance and read "Quit" over "Ghostex" instead of
+    offering to switch sessions again.
 
-    CDXC:GhostexTui 2026-05-25-17:58:
-    The switcher quit label should keep "Quit" on the first row and "GTX TUI"
+    CDXC:GhostexTui 2026-06-09-09:22:
+    The switcher quit label should keep "Quit" on the first row and "Ghostex"
     on the second row.
 
     CDXC:GhostexTui 2026-05-25-18:37:
@@ -937,11 +954,11 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
     render on the top edge instead of below the bar to divide session output
     from Ghostex controls.
 
-    CDXC:GhostexTui 2026-05-26-09:10:
-    In switcher mode, replace the left title area with a Hotkeys button that
-    opens the shortcuts overlay. The switcher already shows session context,
-    so repeating the Ghostex/title label is less useful than discoverable TUI
-    controls.
+    CDXC:GhostexTui 2026-06-09-09:22:
+    In switcher mode, replace the left title area with a "Help &" over
+    "Hotkeys" button that opens the shortcuts overlay. The switcher already
+    shows session context, so repeating the Ghostex/title label is less useful
+    than discoverable TUI controls.
 
     CDXC:GhostexTui 2026-05-26-03:39:
     Attached-view working/attention totals should remain compact dot counters;
@@ -954,17 +971,17 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
     put the activity totals directly below it so the center title remains only
     session context.
     */
-    let header_style = Style::default().bg(Color::Rgb(24, 24, 37));
+    let header_style = Style::default().bg(TUI_BG);
     frame.render_widget(Clear, area);
     frame.render_widget(Paragraph::new("").style(header_style), area);
     let switch = switch_button_rect(area);
     if app.mode == Mode::Switcher {
         frame.render_widget(
-            Paragraph::new("Hotkeys")
+            Paragraph::new("Help &\nHotkeys")
                 .style(
                     Style::default()
                         .fg(Color::White)
-                        .bg(Color::Rgb(49, 50, 68))
+                        .bg(TUI_SELECTED_BG)
                         .add_modifier(Modifier::BOLD),
                 )
                 .alignment(Alignment::Center)
@@ -991,7 +1008,7 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
                     project_badge_label(app.active_session.as_ref()),
                     Style::default()
                         .fg(Color::Black)
-                        .bg(Color::Rgb(137, 180, 250))
+                        .bg(TUI_ACCENT_BLUE)
                         .add_modifier(Modifier::BOLD),
                 ))),
                 Rect::new(project_badge.x, project_badge.y, project_badge.width, 1),
@@ -1002,7 +1019,7 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
                 Paragraph::new(Line::from(activity_count_badge_spans(
                     app.activity_count(SessionActivity::Working),
                     app.activity_count(SessionActivity::Attention),
-                    Color::Rgb(24, 24, 37),
+                    TUI_BG,
                 )))
                 .style(header_style)
                 .alignment(Alignment::Center),
@@ -1033,12 +1050,12 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(
         Paragraph::new(match app.mode {
             Mode::Attached => "switch\nsession",
-            Mode::Switcher => "Quit\nGTX TUI",
+            Mode::Switcher => "Quit\nGhostex",
         })
         .style(
             Style::default()
                 .fg(Color::White)
-                .bg(Color::Rgb(49, 50, 68))
+                .bg(TUI_SELECTED_BG)
                 .add_modifier(Modifier::BOLD),
         )
         .alignment(Alignment::Center)
@@ -1047,11 +1064,8 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
     );
     if area.height > 0 {
         frame.render_widget(
-            Paragraph::new("─".repeat(area.width as usize)).style(
-                Style::default()
-                    .fg(Color::Rgb(69, 71, 90))
-                    .bg(Color::Rgb(24, 24, 37)),
-            ),
+            Paragraph::new("─".repeat(area.width as usize))
+                .style(Style::default().fg(TUI_RULE).bg(TUI_BG)),
             Rect::new(area.x, area.y, area.width, 1),
         );
     }
@@ -1063,7 +1077,7 @@ fn render_terminal(frame: &mut Frame, app: &mut App, area: Rect) {
         render_terminal_selection(frame, app, pty, area);
     } else {
         frame.render_widget(
-            Paragraph::new(app.status.as_str()).style(Style::default().fg(Color::Red)),
+            Paragraph::new(app.status.as_str()).style(Style::default().fg(TUI_DANGER).bg(TUI_BG)),
             area,
         );
     }
@@ -1089,11 +1103,7 @@ fn render_terminal_selection(frame: &mut Frame, app: &App, pty: &PtySession, are
         for x in 0..area.width {
             if selection.contains(y, x, metrics) {
                 let cell = &mut buf[(area.x + x, area.y + y)];
-                cell.set_style(
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Rgb(137, 180, 250)),
-                );
+                cell.set_style(Style::default().fg(Color::Black).bg(TUI_ACCENT_BLUE));
             }
         }
     }
@@ -1222,6 +1232,7 @@ fn emit_terminal_bell() {
 
 fn render_switcher(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(Clear, area);
+    frame.render_widget(Paragraph::new("").style(Style::default().bg(TUI_BG)), area);
     let content = switcher_content_rect(area);
     app.keep_selected_visible(content);
     let visible_rows = app
@@ -1233,15 +1244,11 @@ fn render_switcher(frame: &mut Frame, app: &mut App, area: Rect) {
         .map(|(idx, row)| match row {
             SwitchRow::Project(project) => {
                 let selected = idx == app.selected_row_index;
-                let bg = if selected {
-                    Color::Rgb(49, 50, 68)
-                } else {
-                    Color::Reset
-                };
+                let bg = if selected { TUI_SELECTED_BG } else { TUI_BG };
                 ListItem::new(Line::from(Span::styled(
                     project.name.clone(),
                     Style::default()
-                        .fg(Color::Rgb(137, 180, 250))
+                        .fg(TUI_ACCENT_BLUE)
                         .bg(bg)
                         .add_modifier(Modifier::BOLD),
                 )))
@@ -1249,11 +1256,7 @@ fn render_switcher(frame: &mut Frame, app: &mut App, area: Rect) {
             }
             SwitchRow::NewTerminal { .. } => {
                 let selected = idx == app.selected_row_index;
-                let bg = if selected {
-                    Color::Rgb(49, 50, 68)
-                } else {
-                    Color::Reset
-                };
+                let bg = if selected { TUI_SELECTED_BG } else { TUI_BG };
                 /*
                 CDXC:GhostexTui 2026-05-25-17:20:
                 Each switcher project should expose a create-terminal action
@@ -1273,7 +1276,7 @@ fn render_switcher(frame: &mut Frame, app: &mut App, area: Rect) {
                 ListItem::new(Line::from(Span::styled(
                     "    Create new terminal",
                     Style::default()
-                        .fg(Color::Rgb(205, 214, 244))
+                        .fg(TUI_TEXT)
                         .bg(bg)
                         .add_modifier(if selected {
                             Modifier::BOLD
@@ -1285,11 +1288,7 @@ fn render_switcher(frame: &mut Frame, app: &mut App, area: Rect) {
             }
             SwitchRow::Session(session) => {
                 let selected = idx == app.selected_row_index;
-                let bg = if selected {
-                    Color::Rgb(49, 50, 68)
-                } else {
-                    Color::Reset
-                };
+                let bg = if selected { TUI_SELECTED_BG } else { TUI_BG };
                 let mut spans = vec![
                     activity_dot_span(session, bg),
                     Span::styled(
@@ -1322,8 +1321,10 @@ fn render_switcher(frame: &mut Frame, app: &mut App, area: Rect) {
             Block::default()
                 .title(" switch session ")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Rgb(137, 180, 250))),
+                .border_style(Style::default().fg(TUI_ACCENT_BLUE))
+                .style(Style::default().bg(TUI_BG)),
         )
+        .style(Style::default().bg(TUI_BG))
         .highlight_symbol(" ");
     frame.render_stateful_widget(list, area, &mut state);
 }
@@ -1340,12 +1341,12 @@ fn render_context_menu(frame: &mut Frame, menu: &ContextMenu, full: Rect) {
         .map(|(idx, action)| {
             let selected = idx == menu.selected_index;
             let bg = if selected {
-                Color::Rgb(49, 50, 68)
+                TUI_SELECTED_BG
             } else {
-                Color::Rgb(24, 24, 37)
+                TUI_SURFACE
             };
             let fg = if action.danger {
-                Color::Rgb(255, 121, 121)
+                TUI_DANGER
             } else {
                 Color::White
             };
@@ -1368,8 +1369,8 @@ fn render_context_menu(frame: &mut Frame, menu: &ContextMenu, full: Rect) {
                 Block::default()
                     .title(format!(" {} ", menu.title))
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Rgb(137, 180, 250)))
-                    .style(Style::default().bg(Color::Rgb(24, 24, 37))),
+                    .border_style(Style::default().fg(TUI_ACCENT_BLUE))
+                    .style(Style::default().bg(TUI_SURFACE)),
             )
             .highlight_symbol(" "),
         area,
@@ -1383,11 +1384,11 @@ fn render_input_prompt(frame: &mut Frame, prompt: &InputPrompt, full: Rect) {
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(format!("{}\n\n{}", prompt.title, prompt.value))
-            .style(Style::default().fg(Color::White).bg(Color::Rgb(24, 24, 37)))
+            .style(Style::default().fg(Color::White).bg(TUI_SURFACE))
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Rgb(137, 180, 250))),
+                    .border_style(Style::default().fg(TUI_ACCENT_BLUE)),
             ),
         area,
     );
@@ -1405,54 +1406,51 @@ fn render_hotkeys_overlay(frame: &mut Frame, full: Rect) {
     frame.render_widget(Clear, area);
     let lines = vec![
         Line::from(vec![
-            Span::styled("Ctrl+Q", Style::default().fg(Color::Rgb(137, 180, 250))),
-            Span::raw("  Quit GTX TUI"),
+            Span::styled("Ctrl+Q", Style::default().fg(TUI_ACCENT_BLUE)),
+            Span::raw("  Quit Ghostex"),
         ]),
         Line::from(vec![
-            Span::styled("Ctrl+S", Style::default().fg(Color::Rgb(137, 180, 250))),
+            Span::styled("Ctrl+S", Style::default().fg(TUI_ACCENT_BLUE)),
             Span::raw("  Open switcher from attached session"),
         ]),
         Line::from(vec![
-            Span::styled("Ctrl+K", Style::default().fg(Color::Rgb(137, 180, 250))),
+            Span::styled("Ctrl+K", Style::default().fg(TUI_ACCENT_BLUE)),
             Span::raw("  Open context menu"),
         ]),
         Line::from(vec![
-            Span::styled("Esc", Style::default().fg(Color::Rgb(137, 180, 250))),
+            Span::styled("Esc", Style::default().fg(TUI_ACCENT_BLUE)),
             Span::raw("     Close overlay/menu, or return to session"),
         ]),
         Line::from(vec![
-            Span::styled("Up/Down", Style::default().fg(Color::Rgb(137, 180, 250))),
+            Span::styled("Up/Down", Style::default().fg(TUI_ACCENT_BLUE)),
             Span::raw(" Move selection"),
         ]),
         Line::from(vec![
-            Span::styled("Left/Right", Style::default().fg(Color::Rgb(137, 180, 250))),
+            Span::styled("Left/Right", Style::default().fg(TUI_ACCENT_BLUE)),
             Span::raw(" Jump projects"),
         ]),
         Line::from(vec![
-            Span::styled("PgUp/PgDn", Style::default().fg(Color::Rgb(137, 180, 250))),
+            Span::styled("PgUp/PgDn", Style::default().fg(TUI_ACCENT_BLUE)),
             Span::raw(" Jump 5 rows"),
         ]),
         Line::from(vec![
-            Span::styled(
-                "Enter/Space",
-                Style::default().fg(Color::Rgb(137, 180, 250)),
-            ),
+            Span::styled("Enter/Space", Style::default().fg(TUI_ACCENT_BLUE)),
             Span::raw(" Attach, create, or confirm"),
         ]),
         Line::from(""),
         Line::from(Span::styled(
             "Click anywhere or press Esc to close",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(TUI_SUBTLE_TEXT),
         )),
     ];
     frame.render_widget(
         Paragraph::new(lines)
-            .style(Style::default().fg(Color::White).bg(Color::Rgb(24, 24, 37)))
+            .style(Style::default().fg(Color::White).bg(TUI_SURFACE))
             .block(
                 Block::default()
                     .title(" Hotkeys ")
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Rgb(137, 180, 250))),
+                    .border_style(Style::default().fg(TUI_ACCENT_BLUE)),
             ),
         area,
     );
@@ -2540,29 +2538,53 @@ fn fixed_display_prefix(text: &str, width: usize) -> String {
 }
 
 fn agent_indicator(session: &SessionItem) -> &'static str {
+    /*
+    CDXC:GhostexTuiAgentLabels 2026-06-09-11:53:
+    The TUI switcher should recognize every built-in macOS sidebar agent, including hidden restorable agents and common command/display-name aliases, so restored sessions do not collapse to UNK when they come from the desktop app.
+    Keep these indicators to three columns because switcher rows reserve a fixed-width agent badge before the session title.
+    */
     match normalized_agent(session).as_str() {
-        "antigravity" | "antigravity-cli" => "AGY",
-        "claude" | "claude-code" => "CLD",
-        "codex" | "codex-cli" | "work-codex" => "CDX",
-        "copilot" => "PLT",
-        "cursor" | "cursor-cli" => "CRS",
+        "agy" | "anti-gravity" | "anti-gravity-cli" | "antigravity" | "antigravity-cli" => "AGY",
+        "amp" | "amp-cli" => "AMP",
+        "claude" | "claude-code" | "claude-work" => "CLD",
+        "codebuddy" | "code-buddy" => "CDB",
+        "codex" | "codex-cli" | "work-codex" | "open-ai" | "openai" | "openai-codex" => "CDX",
+        "copilot" | "github-copilot" => "PLT",
+        "cursor" | "cursor-agent" | "cursor-cli" => "CRS",
+        "droid" | "factory" | "factory-droid" => "DRD",
         "gemini" => "GEM",
         "grok" | "grok-build" => "GRK",
-        "pi" => "PIA",
+        "hermes" | "hermes-agent" => "HMS",
+        "opencode" | "open-code" => "OPC",
+        "pi" | "pi-agent" | "π" => "PIA",
+        "qoder" | "qodercli" => "QDR",
+        "rovo" | "rovo-dev" | "rovodev" => "RVO",
         "t3" | "t3-code" => "T3C",
         _ => "UNK",
     }
 }
 
 fn agent_color(session: &SessionItem) -> Color {
+    /*
+    CDXC:GhostexTuiAgentColors 2026-06-09-11:29:
+    Agent labels in the Ghostex TUI switcher should cover the macOS sidebar catalog, including hidden restorable agents. OpenAI/Codex is blue, Claude is orange, Gemini/Antigravity share periwinkle, Cursor/Copilot/Grok/Amp and hidden agents are white, OpenCode and Factory keep distinct product-tinted accents, and unknown/fallback labels are gray.
+    Keep this mapping independent from background colors so agent identity remains legible on selected and unselected gray rows.
+    */
     match normalized_agent(session).as_str() {
-        "antigravity" | "antigravity-cli" | "cursor" | "cursor-cli" => Color::Rgb(116, 155, 255),
-        "claude" | "claude-code" => Color::Rgb(217, 119, 87),
-        "codex" | "codex-cli" | "work-codex" => Color::Rgb(169, 145, 255),
-        "gemini" => Color::Rgb(139, 154, 255),
-        "pi" => Color::Rgb(200, 255, 98),
+        "agy" | "anti-gravity" | "anti-gravity-cli" | "antigravity" | "antigravity-cli"
+        | "gemini" => TUI_AGENT_PERIWINKLE,
+        "claude" | "claude-code" | "claude-work" => TUI_AGENT_CLAUDE_ORANGE,
+        "codex" | "codex-cli" | "work-codex" | "open-ai" | "openai" | "openai-codex" => {
+            TUI_ACCENT_BLUE
+        }
+        "droid" | "factory" | "factory-droid" => TUI_AGENT_FACTORY_ORANGE,
+        "opencode" | "open-code" => TUI_AGENT_OPENCODE_BLUE,
+        "amp" | "amp-cli" | "codebuddy" | "code-buddy" | "copilot" | "cursor" | "cursor-agent"
+        | "cursor-cli" | "github-copilot" | "grok" | "grok-build" | "hermes" | "hermes-agent"
+        | "qoder" | "qodercli" | "rovo" | "rovo-dev" | "rovodev" => Color::White,
+        "pi" | "pi-agent" | "π" => Color::Rgb(200, 255, 98),
         "t3" | "t3-code" => Color::Rgb(255, 106, 243),
-        _ => Color::White,
+        _ => TUI_SUBTLE_TEXT,
     }
 }
 
@@ -2721,6 +2743,86 @@ mod tests {
         assert_eq!(project_badge_rect(header), Rect::new(2, 11, 9, 2));
         assert_eq!(switch_button_rect(header), Rect::new(43, 11, 9, 2));
         assert_eq!(hotkeys_button_rect(header), Rect::new(2, 11, 14, 2));
+    }
+
+    #[test]
+    fn wrapper_palette_uses_gray_backgrounds_and_blue_accent() {
+        assert_eq!(TUI_BG, Color::Rgb(22, 24, 28));
+        assert_eq!(TUI_SURFACE, Color::Rgb(34, 39, 46));
+        assert_eq!(TUI_SELECTED_BG, Color::Rgb(45, 54, 64));
+        assert_eq!(TUI_ACCENT_BLUE, Color::Rgb(88, 166, 255));
+    }
+
+    #[test]
+    fn agent_colors_cover_macos_sidebar_catalog() {
+        let mut session = test_session("alpha", "one");
+        let cases = [
+            ("t3", "T3C", Color::Rgb(255, 106, 243)),
+            ("T3 Code", "T3C", Color::Rgb(255, 106, 243)),
+            ("codex", "CDX", TUI_ACCENT_BLUE),
+            ("Open AI", "CDX", TUI_ACCENT_BLUE),
+            ("openai-codex", "CDX", TUI_ACCENT_BLUE),
+            ("claude", "CLD", TUI_AGENT_CLAUDE_ORANGE),
+            ("Claude Work", "CLD", TUI_AGENT_CLAUDE_ORANGE),
+            ("cursor", "CRS", Color::White),
+            ("cursor-agent", "CRS", Color::White),
+            ("cursor-cli", "CRS", Color::White),
+            ("pi", "PIA", Color::Rgb(200, 255, 98)),
+            ("Pi Agent", "PIA", Color::Rgb(200, 255, 98)),
+            ("opencode", "OPC", TUI_AGENT_OPENCODE_BLUE),
+            ("Open Code", "OPC", TUI_AGENT_OPENCODE_BLUE),
+            ("gemini", "GEM", TUI_AGENT_PERIWINKLE),
+            ("copilot", "PLT", Color::White),
+            ("GitHub Copilot", "PLT", Color::White),
+            ("droid", "DRD", TUI_AGENT_FACTORY_ORANGE),
+            ("Factory Droid", "DRD", TUI_AGENT_FACTORY_ORANGE),
+            ("grok", "GRK", Color::White),
+            ("Grok Build", "GRK", Color::White),
+            ("agy", "AGY", TUI_AGENT_PERIWINKLE),
+            ("Antigravity CLI", "AGY", TUI_AGENT_PERIWINKLE),
+            ("Anti Gravity", "AGY", TUI_AGENT_PERIWINKLE),
+            ("amp", "AMP", Color::White),
+            ("Amp CLI", "AMP", Color::White),
+            ("rovodev", "RVO", Color::White),
+            ("Rovo Dev", "RVO", Color::White),
+            ("hermes", "HMS", Color::White),
+            ("Hermes Agent", "HMS", Color::White),
+            ("codebuddy", "CDB", Color::White),
+            ("Code Buddy", "CDB", Color::White),
+            ("qoder", "QDR", Color::White),
+            ("qodercli", "QDR", Color::White),
+            ("unknown-agent", "UNK", TUI_SUBTLE_TEXT),
+        ];
+
+        for (agent, indicator, color) in cases {
+            session.agent = Some(agent.to_string());
+            assert_eq!(
+                agent_indicator(&session),
+                indicator,
+                "indicator for {agent}"
+            );
+            assert_eq!(agent_color(&session), color, "color for {agent}");
+        }
+    }
+
+    #[test]
+    fn switcher_header_renders_help_hotkeys_and_quit_ghostex_labels() {
+        let app = test_app(Vec::new());
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(48, 3)).unwrap();
+
+        terminal
+            .draw(|frame| render_header(frame, &app, Rect::new(0, 0, 48, 3)))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let first_label_row = buffer_row_text(buffer, 1, 48);
+        let second_label_row = buffer_row_text(buffer, 2, 48);
+
+        assert!(first_label_row.contains("Help &"));
+        assert!(second_label_row.contains("Hotkeys"));
+        assert!(first_label_row.contains("Quit"));
+        assert!(second_label_row.contains("Ghostex"));
+        assert!(!second_label_row.contains("GTX TUI"));
     }
 
     #[test]

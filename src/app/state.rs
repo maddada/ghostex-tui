@@ -78,23 +78,28 @@ pub struct Palette {
 }
 
 impl Palette {
-    /// Catppuccin Mocha — the default.
+    /// Default Ghostex gray-blue palette, kept under the Catppuccin name for config compatibility.
     pub fn catppuccin() -> Self {
+        /*
+        CDXC:TuiTheme 2026-06-09-09:59:
+        Default TUI backgrounds should be neutral gray/cool gray rather than purple, while blue remains the active accent for borders, selections, and notification highlights.
+        Keep the `catppuccin` theme key stable so existing configs still resolve to the default visual scheme.
+        */
         Self {
-            accent: Color::Rgb(137, 180, 250), // blue
-            panel_bg: Color::Rgb(24, 24, 37),
-            surface0: Color::Rgb(49, 50, 68),
-            surface1: Color::Rgb(69, 71, 90),
-            surface_dim: Color::Rgb(30, 30, 46),
-            overlay0: Color::Rgb(108, 112, 134),
-            overlay1: Color::Rgb(127, 132, 156),
-            text: Color::Rgb(205, 214, 244),
-            subtext0: Color::Rgb(166, 173, 200),
-            mauve: Color::Rgb(203, 166, 247),
+            accent: Color::Rgb(88, 166, 255),
+            panel_bg: Color::Rgb(22, 24, 28),
+            surface0: Color::Rgb(34, 39, 46),
+            surface1: Color::Rgb(70, 82, 96),
+            surface_dim: Color::Rgb(17, 19, 23),
+            overlay0: Color::Rgb(110, 118, 129),
+            overlay1: Color::Rgb(139, 148, 158),
+            text: Color::Rgb(230, 237, 243),
+            subtext0: Color::Rgb(139, 148, 158),
+            mauve: Color::Rgb(121, 192, 255),
             green: Color::Rgb(166, 227, 161),
             yellow: Color::Rgb(249, 226, 175),
-            red: Color::Rgb(243, 139, 168),
-            blue: Color::Rgb(137, 180, 250),
+            red: Color::Rgb(255, 123, 114),
+            blue: Color::Rgb(88, 166, 255),
             teal: Color::Rgb(148, 226, 213),
             peach: Color::Rgb(250, 179, 135),
         }
@@ -1501,6 +1506,17 @@ mod tests {
                 "theme should resolve: {name}"
             );
         }
+    }
+
+    #[test]
+    fn default_palette_uses_gray_backgrounds_and_blue_accent() {
+        let palette = Palette::catppuccin();
+
+        assert_eq!(palette.panel_bg, Color::Rgb(22, 24, 28));
+        assert_eq!(palette.surface0, Color::Rgb(34, 39, 46));
+        assert_eq!(palette.surface1, Color::Rgb(70, 82, 96));
+        assert_eq!(palette.accent, Color::Rgb(88, 166, 255));
+        assert_eq!(palette.blue, palette.accent);
     }
 
     #[test]
