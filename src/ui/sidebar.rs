@@ -8,7 +8,7 @@ use ratatui::{
 
 use super::scrollbar::{render_scrollbar, should_show_scrollbar};
 use super::status::{agent_icon, state_dot, state_label, state_label_color};
-use crate::app::state::{AgentPanelScope, Palette};
+use crate::app::state::{AgentPanelScope, Palette, DONE_ATTENTION_STATUS_COLOR};
 use crate::app::{AppState, Mode};
 use crate::detect::AgentState;
 use crate::terminal::TerminalRuntimeRegistry;
@@ -1019,7 +1019,9 @@ fn render_workspace_list(
             Line::from(vec![
                 Span::styled(
                     "● ",
-                    Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(DONE_ATTENTION_STATUS_COLOR)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled("menu", Style::default().fg(p.overlay0)),
             ])
@@ -1177,7 +1179,9 @@ fn render_sidebar_toggle(
         return;
     }
     let icon_style = if app.global_menu_attention_badge_visible() {
-        Style::default().fg(p.accent).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(DONE_ATTENTION_STATUS_COLOR)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(p.overlay0)
     };

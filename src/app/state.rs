@@ -7,6 +7,12 @@ use crate::detect::AgentState;
 use crate::layout::{PaneId, PaneInfo, SplitBorder};
 use crate::selection::Selection;
 
+/*
+CDXC:TuiStatusIndicators 2026-06-12-02:32:
+Done and attention status in the TUI must use #95d7f6 instead of theme bright green so terminal, macOS, Android, and iOS status language stays consistent. Keep this as a dedicated status color instead of repurposing the theme green token, which still supports unrelated idle, git, and integration accents.
+*/
+pub(crate) const DONE_ATTENTION_STATUS_COLOR: Color = Color::Rgb(0x95, 0xD7, 0xF6);
+
 // ---------------------------------------------------------------------------
 // Selection autoscroll types
 // ---------------------------------------------------------------------------
@@ -63,15 +69,15 @@ pub struct Palette {
     pub subtext0: Color,
     /// Branch name / special label color.
     pub mauve: Color,
-    /// Done / idle states.
+    /// Idle and non-status success accents.
     pub green: Color,
     /// Working / running states.
     pub yellow: Color,
-    /// Needs attention / blocked states.
+    /// Error / blocked severity accents outside the done/attention status marker.
     pub red: Color,
-    /// Unseen / done notification accent.
+    /// General blue accent.
     pub blue: Color,
-    /// Notification accent / unseen markers.
+    /// General teal accent.
     pub teal: Color,
     /// Interrupted / warning states.
     pub peach: Color,

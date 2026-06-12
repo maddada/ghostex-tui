@@ -8,7 +8,7 @@ use ratatui::{
 
 use super::widgets::panel_contrast_fg;
 use crate::{
-    app::state::{Palette, ToastKind, ToastNotification},
+    app::state::{Palette, ToastKind, ToastNotification, DONE_ATTENTION_STATUS_COLOR},
     detect::AgentState,
 };
 
@@ -36,8 +36,7 @@ pub(super) fn render_toast_notification(
     p: &Palette,
 ) {
     let dot_color = match toast.kind {
-        ToastKind::NeedsAttention => p.red,
-        ToastKind::Finished => p.blue,
+        ToastKind::NeedsAttention | ToastKind::Finished => DONE_ATTENTION_STATUS_COLOR,
         ToastKind::UpdateInstalled => p.accent,
     };
     let toast_area = toast_notification_rect(area, toast, offset_for_warning);
@@ -102,9 +101,9 @@ pub(super) fn render_config_diagnostic(frame: &mut Frame, area: Rect, message: &
 
 pub(super) fn state_dot(state: AgentState, seen: bool, p: &Palette) -> (&'static str, Style) {
     match (state, seen) {
-        (AgentState::Blocked, _) => ("●", Style::default().fg(p.red)),
+        (AgentState::Blocked, _) => ("●", Style::default().fg(DONE_ATTENTION_STATUS_COLOR)),
         (AgentState::Working, _) => ("●", Style::default().fg(p.yellow)),
-        (AgentState::Idle, false) => ("●", Style::default().fg(p.teal)),
+        (AgentState::Idle, false) => ("●", Style::default().fg(DONE_ATTENTION_STATUS_COLOR)),
         (AgentState::Idle, true) => ("○", Style::default().fg(p.green)),
         (AgentState::Unknown, _) => ("·", Style::default().fg(p.overlay0)),
     }
@@ -117,9 +116,9 @@ pub(super) fn agent_icon(
     p: &Palette,
 ) -> (&'static str, Style) {
     match (state, seen) {
-        (AgentState::Blocked, _) => ("◉", Style::default().fg(p.red)),
+        (AgentState::Blocked, _) => ("◉", Style::default().fg(DONE_ATTENTION_STATUS_COLOR)),
         (AgentState::Working, _) => (super::spinner_frame(tick), Style::default().fg(p.yellow)),
-        (AgentState::Idle, false) => ("●", Style::default().fg(p.teal)),
+        (AgentState::Idle, false) => ("●", Style::default().fg(DONE_ATTENTION_STATUS_COLOR)),
         (AgentState::Idle, true) => ("✓", Style::default().fg(p.green)),
         (AgentState::Unknown, _) => ("○", Style::default().fg(p.overlay0)),
     }
@@ -137,9 +136,9 @@ pub(super) fn state_label(state: AgentState, seen: bool) -> &'static str {
 
 pub(super) fn state_label_color(state: AgentState, seen: bool, p: &Palette) -> Color {
     match (state, seen) {
-        (AgentState::Blocked, _) => p.red,
+        (AgentState::Blocked, _) => DONE_ATTENTION_STATUS_COLOR,
         (AgentState::Working, _) => p.yellow,
-        (AgentState::Idle, false) => p.teal,
+        (AgentState::Idle, false) => DONE_ATTENTION_STATUS_COLOR,
         (AgentState::Idle, true) => p.green,
         (AgentState::Unknown, _) => p.overlay0,
     }
