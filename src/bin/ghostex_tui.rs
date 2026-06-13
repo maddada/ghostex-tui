@@ -11,8 +11,9 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use crossterm::event::{
     self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
-    EnableFocusChange, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers, MouseButton,
-    MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    EnableFocusChange, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+    MouseButton, MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -32,6 +33,11 @@ use unicode_width::UnicodeWidthChar;
 const POLL_INTERVAL: Duration = Duration::from_millis(16);
 const SESSION_LIST_REFRESH: Duration = Duration::from_secs(5);
 const SELECTION_AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(30);
+/*
+CDXC:GhostexTui 2026-06-13-23:12:
+The session switcher must keep held Up/Down navigation at a normal list-repeat cadence instead of applying every terminal repeat event, while first presses remain immediate and attached terminal input remains unthrottled.
+*/
+const SWITCHER_VERTICAL_NAV_REPEAT_INTERVAL: Duration = Duration::from_millis(90);
 const TERMINAL_SCROLLBACK_BYTES: usize = config::DEFAULT_SCROLLBACK_LIMIT_BYTES;
 const MOUSE_SCROLL_LINES: usize = 3;
 const GHOSTEX_TUI_TERM: &str = "xterm-256color";
@@ -151,6 +157,18 @@ enum Mode {
 enum AttachedSelectionAutoscrollDirection {
     Up,
     Down,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SwitcherVerticalNavKey {
+    Up,
+    Down,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SwitcherVerticalNavRepeat {
+    key: SwitcherVerticalNavKey,
+    last_accepted: Instant,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -384,6 +402,7 @@ struct App {
     selection: Option<selection::Selection>,
     selection_autoscroll: Option<AttachedSelectionAutoscroll>,
     selection_autoscroll_deadline: Option<Instant>,
+    switcher_vertical_nav_repeat: Option<SwitcherVerticalNavRepeat>,
     mode: Mode,
     switch_scroll: usize,
     last_refresh: Instant,
@@ -407,6 +426,7 @@ impl App {
             selection: None,
             selection_autoscroll: None,
             selection_autoscroll_deadline: None,
+            switcher_vertical_nav_repeat: None,
             mode: Mode::Switcher,
             switch_scroll: 0,
             last_refresh: Instant::now() - SESSION_LIST_REFRESH,
@@ -681,6 +701,38 @@ impl App {
         let next = wrap_index(current as isize + delta, selectable_rows.len());
         self.selected_row_index = selectable_rows[next];
         self.sync_selected_session_index_from_row();
+    }
+
+    fn should_handle_switcher_vertical_nav(
+        &mut self,
+        key: SwitcherVerticalNavKey,
+        kind: KeyEventKind,
+        now: Instant,
+    ) -> bool {
+        if kind == KeyEventKind::Release {
+            if self
+                .switcher_vertical_nav_repeat
+                .is_some_and(|repeat| repeat.key == key)
+            {
+                self.switcher_vertical_nav_repeat = None;
+            }
+            return false;
+        }
+
+        if let Some(repeat) = self.switcher_vertical_nav_repeat {
+            if repeat.key == key
+                && now.saturating_duration_since(repeat.last_accepted)
+                    < SWITCHER_VERTICAL_NAV_REPEAT_INTERVAL
+            {
+                return false;
+            }
+        }
+
+        self.switcher_vertical_nav_repeat = Some(SwitcherVerticalNavRepeat {
+            key,
+            last_accepted: now,
+        });
+        true
     }
 
     fn select_project_delta(&mut self, delta: isize) {
@@ -1491,8 +1543,24 @@ fn handle_key(app: &mut App, key: KeyEvent, terminal_rect: Rect) -> bool {
     match app.mode {
         Mode::Switcher => match key.code {
             KeyCode::Esc if app.active_session.is_some() => app.mode = Mode::Attached,
-            KeyCode::Up => app.select_delta(-1),
-            KeyCode::Down => app.select_delta(1),
+            KeyCode::Up => {
+                if app.should_handle_switcher_vertical_nav(
+                    SwitcherVerticalNavKey::Up,
+                    key.kind,
+                    Instant::now(),
+                ) {
+                    app.select_delta(-1);
+                }
+            }
+            KeyCode::Down => {
+                if app.should_handle_switcher_vertical_nav(
+                    SwitcherVerticalNavKey::Down,
+                    key.kind,
+                    Instant::now(),
+                ) {
+                    app.select_delta(1);
+                }
+            }
             KeyCode::Left => app.select_project_delta(-1),
             KeyCode::Right => app.select_project_delta(1),
             KeyCode::PageUp => app.select_delta(-5),
@@ -2640,6 +2708,7 @@ mod tests {
             selection: None,
             selection_autoscroll: None,
             selection_autoscroll_deadline: None,
+            switcher_vertical_nav_repeat: None,
             mode: Mode::Switcher,
             switch_scroll: 0,
             last_refresh: Instant::now(),
@@ -2697,6 +2766,50 @@ mod tests {
 
         app.select_project_delta(-1);
         assert_eq!(app.selected_row_index, 10);
+    }
+
+    #[test]
+    fn switcher_vertical_arrow_repeats_are_throttled() {
+        let mut app = test_app(Vec::new());
+        let start = Instant::now();
+
+        assert!(app.should_handle_switcher_vertical_nav(
+            SwitcherVerticalNavKey::Down,
+            KeyEventKind::Press,
+            start
+        ));
+        assert!(!app.should_handle_switcher_vertical_nav(
+            SwitcherVerticalNavKey::Down,
+            KeyEventKind::Repeat,
+            start + Duration::from_millis(30)
+        ));
+        assert!(app.should_handle_switcher_vertical_nav(
+            SwitcherVerticalNavKey::Down,
+            KeyEventKind::Repeat,
+            start + SWITCHER_VERTICAL_NAV_REPEAT_INTERVAL
+        ));
+    }
+
+    #[test]
+    fn switcher_vertical_arrow_release_clears_repeat_gate() {
+        let mut app = test_app(Vec::new());
+        let start = Instant::now();
+
+        assert!(app.should_handle_switcher_vertical_nav(
+            SwitcherVerticalNavKey::Up,
+            KeyEventKind::Press,
+            start
+        ));
+        assert!(!app.should_handle_switcher_vertical_nav(
+            SwitcherVerticalNavKey::Up,
+            KeyEventKind::Release,
+            start + Duration::from_millis(5)
+        ));
+        assert!(app.should_handle_switcher_vertical_nav(
+            SwitcherVerticalNavKey::Up,
+            KeyEventKind::Press,
+            start + Duration::from_millis(10)
+        ));
     }
 
     #[test]
