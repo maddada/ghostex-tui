@@ -36,8 +36,11 @@ const SELECTION_AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(30);
 /*
 CDXC:GhostexTui 2026-06-13-23:12:
 The session switcher must keep held Up/Down navigation at a normal list-repeat cadence instead of applying every terminal repeat event, while first presses remain immediate and attached terminal input remains unthrottled.
+
+CDXC:GhostexTui 2026-06-15-10:49:
+Held Up/Down navigation in the session switcher should repeat 25% faster than the original 90ms cadence. Use a 72ms throttle so the repeat rate increases by 1.25x without removing the guard against raw terminal repeat bursts.
 */
-const SWITCHER_VERTICAL_NAV_REPEAT_INTERVAL: Duration = Duration::from_millis(90);
+const SWITCHER_VERTICAL_NAV_REPEAT_INTERVAL: Duration = Duration::from_millis(72);
 const TERMINAL_SCROLLBACK_BYTES: usize = config::DEFAULT_SCROLLBACK_LIMIT_BYTES;
 const MOUSE_SCROLL_LINES: usize = 3;
 const GHOSTEX_TUI_TERM: &str = "xterm-256color";
@@ -690,6 +693,10 @@ impl App {
     }
 
     fn select_delta(&mut self, delta: isize) {
+        /*
+        CDXC:GhostexTui 2026-06-15-10:40:
+        Vertical session switcher movement must stop at the first and last selectable rows. Arrow, page, and mouse-wheel navigation should not wrap from the top item to the bottom item or from the bottom item back to the top.
+        */
         let selectable_rows = self.selectable_row_indices();
         if selectable_rows.is_empty() {
             return;
@@ -698,7 +705,7 @@ impl App {
             .iter()
             .position(|row| *row == self.selected_row_index)
             .unwrap_or(0);
-        let next = wrap_index(current as isize + delta, selectable_rows.len());
+        let next = (current as isize + delta).clamp(0, selectable_rows.len() as isize - 1) as usize;
         self.selected_row_index = selectable_rows[next];
         self.sync_selected_session_index_from_row();
     }
@@ -2769,10 +2776,49 @@ mod tests {
     }
 
     #[test]
+    fn switcher_vertical_selection_clamps_at_list_edges() {
+        let mut app = test_app(vec![
+            ProjectGroup {
+                project_id: Some("alpha".to_string()),
+                group_id: Some("alpha-group".to_string()),
+                name: "alpha".to_string(),
+                path: Some("/alpha".to_string()),
+                sessions: vec![test_session("alpha", "one")],
+            },
+            ProjectGroup {
+                project_id: Some("beta".to_string()),
+                group_id: Some("beta-group".to_string()),
+                name: "beta".to_string(),
+                path: Some("/beta".to_string()),
+                sessions: vec![test_session("beta", "one")],
+            },
+        ]);
+
+        app.selected_row_index = 0;
+        app.sync_selected_session_index_from_row();
+        app.select_delta(-1);
+        assert_eq!(app.selected_row_index, 0);
+        app.select_delta(-5);
+        assert_eq!(app.selected_row_index, 0);
+
+        let last_selectable = *app.selectable_row_indices().last().unwrap();
+        app.selected_row_index = last_selectable;
+        app.sync_selected_session_index_from_row();
+        app.select_delta(1);
+        assert_eq!(app.selected_row_index, last_selectable);
+        app.select_delta(5);
+        assert_eq!(app.selected_row_index, last_selectable);
+    }
+
+    #[test]
     fn switcher_vertical_arrow_repeats_are_throttled() {
         let mut app = test_app(Vec::new());
         let start = Instant::now();
 
+        assert_eq!(
+            SWITCHER_VERTICAL_NAV_REPEAT_INTERVAL,
+            Duration::from_millis(72)
+        );
         assert!(app.should_handle_switcher_vertical_nav(
             SwitcherVerticalNavKey::Down,
             KeyEventKind::Press,
@@ -2782,6 +2828,11 @@ mod tests {
             SwitcherVerticalNavKey::Down,
             KeyEventKind::Repeat,
             start + Duration::from_millis(30)
+        ));
+        assert!(!app.should_handle_switcher_vertical_nav(
+            SwitcherVerticalNavKey::Down,
+            KeyEventKind::Repeat,
+            start + SWITCHER_VERTICAL_NAV_REPEAT_INTERVAL - Duration::from_millis(1)
         ));
         assert!(app.should_handle_switcher_vertical_nav(
             SwitcherVerticalNavKey::Down,
